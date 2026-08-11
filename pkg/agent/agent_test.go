@@ -7834,3 +7834,125 @@ func TestRunWorkerPanicReleasesSessionTurnState(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+type visionRerouteTextProvider struct {
+	calls int
+}
+
+func (p *visionRerouteTextProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	p.calls++
+	return nil, fmt.Errorf("API request failed: Status: 400 Body: {\"error\":{\"message\":\"No endpoints found that support image input\"}}")
+}
+
+func (p *visionRerouteTextProvider) GetDefaultModel() string {
+	return "vision-reroute-text-model"
+}
+
+type visionRerouteSuccessProvider struct {
+	calls     int
+	models    []string
+	mediaSeen []bool
+}
+
+func (p *visionRerouteSuccessProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	p.calls++
+	p.models = append(p.models, model)
+	seenMedia := false
+	for _, msg := range messages {
+		for _, ref := range msg.Media {
+			if strings.TrimSpace(ref) != "" {
+				seenMedia = true
+				break
+			}
+		}
+		if seenMedia {
+			break
+		}
+	}
+	p.mediaSeen = append(p.mediaSeen, seenMedia)
+	return &providers.LLMResponse{Content: "rerouted vision answer"}, nil
+}
+
+func (p *visionRerouteSuccessProvider) GetDefaultModel() string {
+	return "vision-reroute-success-model"
+}
+
+func TestAgentLoop_VisionUnsupportedErrorReroutesToAlternateImageModel(t *testing.T) {
+	workspace := t.TempDir()
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:           workspace,
+				ModelName:           "text-model",
+				ImageModel:          "broken-vision-model",
+				ImageModelFallbacks: []string{"gpt-5.4"},
+				MaxTokens:           4096,
+				MaxToolIterations:   3,
+			},
+		},
+		ModelList: []*config.ModelConfig{
+			{ModelName: "text-model", Model: "openai/text-model"},
+			{ModelName: "broken-vision-model", Provider: "openai", Model: "broken-vision-model"},
+			{ModelName: "gpt-5.4", Provider: "openai", Model: "gpt-5.4"},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	textProvider := &visionRerouteTextProvider{}
+	al := NewAgentLoop(cfg, msgBus, textProvider)
+
+	agent := al.registry.GetDefaultAgent()
+	if agent == nil {
+		t.Fatal("expected default agent")
+	}
+	successProvider := &visionRerouteSuccessProvider{}
+	agent.CandidateProviders[providers.ModelKey("openai", "broken-vision-model")] = textProvider
+	agent.CandidateProviders[providers.ModelKey("openai", "gpt-5.4")] = successProvider
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), responseTimeout)
+	defer cancel()
+
+	resp, err := al.processMessage(timeoutCtx, testInboundMessage(bus.InboundMessage{
+		Context: bus.InboundContext{
+			Channel:   "telegram",
+			ChatID:    "chat1",
+			ChatType:  "direct",
+			SenderID:  "user1",
+			MessageID: "m1",
+		},
+		Content:    "describe this",
+		Media:      []string{"media://example"},
+		SessionKey: "agent:main:telegram:direct:user1",
+	}))
+	if err != nil {
+		t.Fatalf("processMessage() error = %v", err)
+	}
+	if resp != "rerouted vision answer" {
+		t.Fatalf("response = %q, want %q", resp, "rerouted vision answer")
+	}
+	if textProvider.calls != 1 {
+		t.Fatalf("textProvider calls = %d, want 1", textProvider.calls)
+	}
+	if successProvider.calls != 1 {
+		t.Fatalf("successProvider calls = %d, want 1", successProvider.calls)
+	}
+	if !slices.Equal(successProvider.models, []string{"gpt-5.4"}) {
+		t.Fatalf("successProvider models = %v, want %v", successProvider.models, []string{"gpt-5.4"})
+	}
+	if !slices.Equal(successProvider.mediaSeen, []bool{true}) {
+		t.Fatalf("successProvider mediaSeen = %v, want %v", successProvider.mediaSeen, []bool{true})
+	}
+}

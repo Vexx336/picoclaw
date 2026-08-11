@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
 )
@@ -73,25 +74,30 @@ func isVisionUnsupportedError(err error) bool {
 
 func visionUnsupportedModelError(modelName string, imageModelConfigured bool) error {
 	modelName = strings.TrimSpace(modelName)
+	guidance := "update agents.defaults.image_model (or image_model_fallbacks) to a multimodal model such as gpt-5.4, gpt-4o, claude-sonnet-4.6, or gemini-2.0-flash"
 	if imageModelConfigured {
 		if modelName != "" {
 			return fmt.Errorf(
-				"selected vision model %q does not support image input; update agents.defaults.image_model to a multimodal model",
+				"selected vision model %q does not support image input; %s",
 				modelName,
+				guidance,
 			)
 		}
 		return fmt.Errorf(
-			"selected vision model does not support image input; update agents.defaults.image_model to a multimodal model",
+			"selected vision model does not support image input; %s",
+			guidance,
 		)
 	}
 	if modelName != "" {
 		return fmt.Errorf(
-			"active model %q does not support image input; configure agents.defaults.image_model with a multimodal model",
+			"active model %q does not support image input; %s",
 			modelName,
+			guidance,
 		)
 	}
 	return fmt.Errorf(
-		"the active model does not support image input; configure agents.defaults.image_model with a multimodal model",
+		"the active model does not support image input; %s",
+		guidance,
 	)
 }
 
@@ -190,4 +196,124 @@ func (p *Pipeline) routeMediaTurn(ts *turnState, exec *turnExecution) error {
 	})
 
 	return nil
+}
+
+func modelConfigLooksVisionCapable(mc *config.ModelConfig) bool {
+	if mc == nil {
+		return false
+	}
+	parts := []string{
+		strings.TrimSpace(mc.ModelName),
+		strings.TrimSpace(mc.Model),
+		strings.TrimSpace(mc.Provider),
+	}
+	combined := strings.ToLower(strings.Join(parts, " "))
+	if combined == "" {
+		return false
+	}
+	visionHints := []string{
+		"gpt-4o",
+		"gpt-4.1",
+		"gpt-5",
+		"claude-3",
+		"claude-opus-4",
+		"claude-sonnet-4",
+		"gemini",
+		"vision",
+		"multimodal",
+		"vl",
+	}
+	for _, hint := range visionHints {
+		if strings.Contains(combined, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Pipeline) recoverVisionRouting(ts *turnState, exec *turnExecution) bool {
+	if p == nil || p.Cfg == nil || ts == nil || ts.agent == nil || exec == nil {
+		return false
+	}
+	if !messagesContainCurrentTurnMediaTurn(currentTurnMessages(exec.callMessages, exec.currentTurnStart)) {
+		return false
+	}
+
+	currentKey := ""
+	if len(exec.activeCandidates) > 0 {
+		currentKey = exec.activeCandidates[0].StableKey()
+	} else {
+		currentKey = providers.ModelKey(
+			resolvedCandidateProvider(exec.activeCandidates, p.Cfg.Agents.Defaults.Provider),
+			resolvedCandidateModel(exec.activeCandidates, exec.activeModel),
+		)
+	}
+
+	candidateNames := make([]string, 0, 8)
+	seenNames := make(map[string]bool)
+	addName := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seenNames[name] {
+			return
+		}
+		seenNames[name] = true
+		candidateNames = append(candidateNames, name)
+	}
+
+	for _, name := range p.Cfg.Agents.Defaults.ImageModelFallbacks {
+		addName(name)
+	}
+	for _, mc := range p.Cfg.ModelList {
+		if !modelConfigLooksVisionCapable(mc) {
+			continue
+		}
+		addName(strings.TrimSpace(mc.ModelName))
+	}
+
+	for _, name := range candidateNames {
+		resolved := resolveModelCandidates(
+			p.Cfg,
+			p.Cfg.Agents.Defaults.Provider,
+			name,
+			nil,
+		)
+		if len(resolved) == 0 {
+			continue
+		}
+		if resolved[0].StableKey() == currentKey {
+			continue
+		}
+		provider, ok := ts.agent.CandidateProviders[resolved[0].StableKey()]
+		if !ok || provider == nil {
+			populateCandidateProvidersFromNames(p.Cfg, ts.agent.Workspace, []string{name}, ts.agent.CandidateProviders)
+			provider = ts.agent.CandidateProviders[resolved[0].StableKey()]
+		}
+		if provider == nil {
+			continue
+		}
+
+		exec.activeCandidates = resolved
+		exec.activeModel = resolvedCandidateModel(resolved, name)
+		exec.activeProvider = provider
+		exec.activeModelConfig = resolveActiveModelConfig(
+			p.Cfg,
+			ts.agent.Workspace,
+			resolved,
+			exec.activeModel,
+			p.Cfg.Agents.Defaults.Provider,
+		)
+		exec.llmModelName = resolvedCandidateModelName(resolved, name)
+		exec.llmModel = exec.activeModel
+		exec.usedLight = false
+
+		logger.WarnCF("agent", "Recovered media turn by switching to alternate multimodal model", map[string]any{
+			"agent_id":       ts.agent.ID,
+			"recovered_from": currentKey,
+			"recovered_to":   resolved[0].StableKey(),
+			"model_name":     exec.llmModelName,
+		})
+		return true
+	}
+
+	return false
 }

@@ -317,6 +317,27 @@ func (p *Pipeline) CallLLM(
 		}
 
 		if hasMediaRefs(exec.callMessages) && isVisionUnsupportedError(err) {
+			if p.recoverVisionRouting(ts, exec) {
+				al.emitEvent(
+					runtimeevents.KindAgentLLMRetry,
+					ts.eventMeta("runTurn", "turn.llm.retry"),
+					LLMRetryPayload{
+						Attempt:    retry + 1,
+						MaxRetries: maxRetries,
+						Reason:     "vision_model_reroute",
+						Error:      err.Error(),
+						Backoff:    0,
+					},
+				)
+				logger.WarnCF("agent", "Vision model unsupported; rerouting media turn to alternate multimodal model", map[string]any{
+					"agent_id":  ts.agent.ID,
+					"iteration": iteration,
+					"retry":     retry,
+					"error":     err.Error(),
+					"model":     exec.llmModelName,
+				})
+				continue
+			}
 			return ControlBreak, visionUnsupportedModelError(
 				exec.llmModelName,
 				len(ts.agent.ImageCandidates) > 0,
