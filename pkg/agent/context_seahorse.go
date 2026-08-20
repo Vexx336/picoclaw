@@ -24,7 +24,7 @@ type seahorseContextManager struct {
 }
 
 // newSeahorseContextManager creates a seahorse-backed ContextManager.
-func newSeahorseContextManager(_ json.RawMessage, al *AgentLoop) (ContextManager, error) {
+func newSeahorseContextManager(raw json.RawMessage, al *AgentLoop) (ContextManager, error) {
 	if al == nil {
 		return nil, fmt.Errorf("seahorse: AgentLoop is required")
 	}
@@ -34,13 +34,24 @@ func newSeahorseContextManager(_ json.RawMessage, al *AgentLoop) (ContextManager
 	agent := al.registry.GetDefaultAgent()
 	dbPath := agent.Workspace + "/sessions/seahorse.db"
 
+	// Parse context_manager_config (semantic memory settings etc.)
+	// Unknown fields are ignored; invalid JSON falls back to defaults.
+	var cfg seahorse.Config
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			logger.WarnCF("seahorse", "invalid context_manager_config; using defaults",
+				map[string]any{"error": err.Error()})
+		}
+	}
+	if cfg.DBPath == "" {
+		cfg.DBPath = dbPath
+	}
+
 	// Create CompleteFn from provider
 	completeFn := providerToCompleteFn(agent.Provider, agent.Model)
 
 	// Create engine
-	engine, err := seahorse.NewEngine(seahorse.Config{
-		DBPath: dbPath,
-	}, completeFn)
+	engine, err := seahorse.NewEngine(cfg, completeFn)
 	if err != nil {
 		return nil, fmt.Errorf("seahorse: create engine: %w", err)
 	}
@@ -55,6 +66,10 @@ func newSeahorseContextManager(_ json.RawMessage, al *AgentLoop) (ContextManager
 	retrieval := mgr.engine.GetRetrieval()
 	al.RegisterTool(seahorse.NewGrepTool(retrieval))
 	al.RegisterTool(seahorse.NewExpandTool(retrieval))
+	if engine.SemanticEnabled() {
+		al.RegisterTool(seahorse.NewSemanticTool(retrieval))
+		mgr.startSemanticBackfill()
+	}
 
 	// Bootstrap all existing sessions at startup
 	if agent.Sessions != nil {
@@ -65,6 +80,24 @@ func newSeahorseContextManager(_ json.RawMessage, al *AgentLoop) (ContextManager
 	}
 
 	return mgr, nil
+}
+
+// startSemanticBackfill embeds historical messages that lack vectors. Runs in
+// the background after a short delay so the gateway boots fast; resumes on
+// restart until every message has a vector.
+func (m *seahorseContextManager) startSemanticBackfill() {
+	go func() {
+		time.Sleep(2 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+		defer cancel()
+		n, err := m.engine.SemanticBackfill(ctx, 16)
+		if err != nil && ctx.Err() == nil {
+			logger.WarnCF("seahorse", "semantic backfill stopped early (will resume on restart)",
+				map[string]any{"embedded": n, "error": err.Error()})
+		} else if err == nil {
+			logger.InfoCF("seahorse", "semantic backfill complete", map[string]any{"embedded": n})
+		}
+	}()
 }
 
 // providerToCompleteFn wraps providers.LLMProvider as a seahorse.CompleteFn.

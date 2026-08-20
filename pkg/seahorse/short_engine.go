@@ -3,6 +3,7 @@ package seahorse
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,39 @@ type Config struct {
 	DBPath                   string   `json:"dbPath"`
 	IgnoreSessionPatterns    []string `json:"ignoreSessionPatterns,omitempty"`
 	StatelessSessionPatterns []string `json:"statelessSessionPatterns,omitempty"`
+
+	// Semantic memory (Tier 3, M2). When EnableSemantic is false (the
+	// default), no embedding code runs and behavior is identical to pre-M2.
+	EnableSemantic             bool     `json:"enableSemantic,omitempty"`             // master switch
+	EmbeddingEndpoint          string   `json:"embeddingEndpoint,omitempty"`          // e.g. http://100.88.1.92:18084/v1/embeddings
+	EmbeddingModel             string   `json:"embeddingModel,omitempty"`             // e.g. jina-embeddings-v3
+	EmbeddingDim               int      `json:"embeddingDim,omitempty"`               // e.g. 1024
+	TopK                       int      `json:"topK,omitempty"`                       // default 8
+	MinScore                   float64  `json:"minScore,omitempty"`                   // default 0.35
+	AsyncWrite                 *bool    `json:"asyncWrite,omitempty"`                 // default true (nil = true)
+	IgnoreSessionsForEmbedding []string `json:"ignoreSessionsForEmbedding,omitempty"` // session globs to skip embedding
+}
+
+// AsyncWriteEnabled reports whether async embedding is enabled (default true).
+func (c Config) AsyncWriteEnabled() bool {
+	return c.AsyncWrite == nil || *c.AsyncWrite
+}
+
+// ValidateSemantic verifies the semantic-memory configuration is complete.
+func (c Config) ValidateSemantic() error {
+	if !c.EnableSemantic {
+		return nil
+	}
+	if normalizeEmbeddingEndpoint(c.EmbeddingEndpoint) == "" {
+		return errors.New("enableSemantic requires embeddingEndpoint (e.g. http://100.88.1.92:18084/v1/embeddings)")
+	}
+	if c.EmbeddingModel == "" {
+		return errors.New("enableSemantic requires embeddingModel")
+	}
+	if c.EmbeddingDim <= 0 {
+		return errors.New("enableSemantic requires embeddingDim > 0")
+	}
+	return nil
 }
 
 // CompleteFn is the LLM completion function type.
@@ -61,10 +95,12 @@ type Engine struct {
 	assembler         *Assembler
 	assemblerMu       sync.Mutex
 	retrieval         *RetrievalEngine
+	semantic          *SemanticEngine
 	config            Config
 	complete          CompleteFn
 	ignorePatterns    []*regexp.Regexp
 	statelessPatterns []*regexp.Regexp
+	embedSkipPatterns []*regexp.Regexp
 	sessionShards     [numSessionShards]struct {
 		mu sync.Mutex
 	}
@@ -88,8 +124,9 @@ type Assembler struct {
 
 // RetrievalEngine handles search and expansion (defined in short_retrieval.go).
 type RetrievalEngine struct {
-	store  *Store
-	config Config
+	store    *Store
+	config   Config
+	semantic *SemanticEngine // nil when semantic memory is disabled
 }
 
 // Store returns the underlying store for direct access.
@@ -106,7 +143,7 @@ func NewEngine(config Config, completeFn CompleteFn) (*Engine, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", config.DBPath)
+	db, err := sql.Open("sqlite", sqliteDSN(config.DBPath))
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
@@ -132,23 +169,53 @@ func NewEngine(config Config, completeFn CompleteFn) (*Engine, error) {
 
 	store := &Store{db: db}
 
+	// Semantic memory: optional, off by default.
+	var semantic *SemanticEngine
+	if config.EnableSemantic {
+		if err := config.ValidateSemantic(); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		semantic, err = newSemanticEngine(ctx, db, store, config)
+		cancel()
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("semantic engine: %w", err)
+		}
+	}
+
 	// Prepend hardcoded ignore patterns (spec lines 1326-1328)
 	ignorePatterns := make([]string, 0, 1+len(config.IgnoreSessionPatterns))
 	ignorePatterns = append(ignorePatterns, "heartbeat")
 	ignorePatterns = append(ignorePatterns, config.IgnoreSessionPatterns...)
 
-	retrieval := &RetrievalEngine{store: store, config: config}
+	retrieval := &RetrievalEngine{store: store, config: config, semantic: semantic}
 
 	return &Engine{
 		store:             store,
 		compaction:        nil,
 		assembler:         nil,
 		retrieval:         retrieval,
+		semantic:          semantic,
 		config:            config,
 		complete:          completeFn,
 		ignorePatterns:    compileSessionPatterns(ignorePatterns),
 		statelessPatterns: compileSessionPatterns(config.StatelessSessionPatterns),
+		embedSkipPatterns: compileSessionPatterns(config.IgnoreSessionsForEmbedding),
 	}, nil
+}
+
+// sqliteDSN returns a DSN for config.DBPath with foreign keys enabled so the
+// message_embeddings table cascades deletes with its parent messages row.
+func sqliteDSN(path string) string {
+	if path == ":memory:" || strings.Contains(path, "_pragma=") {
+		return path
+	}
+	if strings.Contains(path, "?") {
+		return path + "&_pragma=foreign_keys(1)"
+	}
+	return path + "?_pragma=foreign_keys(1)"
 }
 
 // compileSessionPattern converts a glob pattern to a compiled regex.
@@ -206,6 +273,17 @@ func (e *Engine) shouldIgnoreSession(sessionKey string) bool {
 // isStatelessSession returns true if the session key matches any stateless pattern.
 func (e *Engine) isStatelessSession(sessionKey string) bool {
 	for _, p := range e.statelessPatterns {
+		if p.MatchString(sessionKey) {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldSkipEmbedding returns true if the session key matches any
+// ignoreSessionsForEmbedding pattern.
+func (e *Engine) shouldSkipEmbedding(sessionKey string) bool {
+	for _, p := range e.embedSkipPatterns {
 		if p.MatchString(sessionKey) {
 			return true
 		}
@@ -288,6 +366,11 @@ func (e *Engine) Ingest(ctx context.Context, sessionKey string, messages []Messa
 		return nil, fmt.Errorf("append context: %w", err)
 	}
 
+	// Enqueue async embeddings for semantic memory (no-op when disabled).
+	if e.semantic != nil && !e.shouldSkipEmbedding(sessionKey) {
+		e.semantic.Enqueue(msgIDs...)
+	}
+
 	logger.InfoCF("seahorse", "ingest", map[string]any{
 		"conv_id":  conv.ConversationID,
 		"messages": len(messages),
@@ -305,10 +388,27 @@ func (e *Engine) Close() error {
 	if e.compaction != nil {
 		e.compaction.Close()
 	}
+	if e.semantic != nil {
+		e.semantic.Close()
+	}
 	if e.store != nil && e.store.db != nil {
 		return e.store.db.Close()
 	}
 	return nil
+}
+
+// SemanticEnabled reports whether the semantic memory engine is active.
+func (e *Engine) SemanticEnabled() bool {
+	return e.semantic != nil
+}
+
+// SemanticBackfill embeds all messages missing vectors for the configured
+// model. No-op when semantic memory is disabled. Returns the count embedded.
+func (e *Engine) SemanticBackfill(ctx context.Context, batchSize int) (int, error) {
+	if e.semantic == nil {
+		return 0, nil
+	}
+	return e.semantic.Backfill(ctx, batchSize)
 }
 
 // GetRetrieval returns the retrieval engine for tool implementations.

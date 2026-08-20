@@ -2,6 +2,7 @@ package seahorse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -211,5 +212,77 @@ func (r *RetrievalEngine) ExpandMessages(ctx context.Context, messageIDs []int64
 		result.TokenCount += msg.TokenCount
 	}
 
+	return result, nil
+}
+
+// SemanticInput controls embedding-based (meaning) search.
+type SemanticInput struct {
+	Query            string  `json:"query"`
+	Limit            int     `json:"limit,omitempty"`            // default config.TopK (8)
+	MinScore         float64 `json:"minScore,omitempty"`         // default config.MinScore (0.35)
+	AllConversations bool    `json:"allConversations,omitempty"` // default true for semantic memory
+	ConversationID   int64   `json:"conversationId,omitempty"`   // scoped when !AllConversations
+}
+
+// Semantic searches message embeddings by meaning (cosine similarity) and
+// returns hits shaped like GrepResult so callers/tools can present them the
+// same way. Rank is the cosine score (higher = more similar), unlike the
+// negative bm25 rank used by Grep.
+func (r *RetrievalEngine) Semantic(ctx context.Context, input SemanticInput) (*GrepResult, error) {
+	if r.semantic == nil {
+		return nil, errors.New("semantic memory is disabled (set context_manager_config.enableSemantic: true)")
+	}
+	if strings.TrimSpace(input.Query) == "" {
+		return nil, errors.New("semantic: query is required")
+	}
+
+	limit := input.Limit
+	if limit <= 0 {
+		limit = r.config.TopK
+	}
+	if limit <= 0 {
+		limit = defaultSemanticTopK
+	}
+	minScore := input.MinScore
+	if minScore == 0 {
+		minScore = r.config.MinScore
+	}
+	if minScore == 0 {
+		minScore = defaultSemanticMinScore
+	}
+
+	vec, err := r.semantic.client.Embed(ctx, input.Query)
+	if err != nil {
+		return nil, fmt.Errorf("semantic: embed query: %w", err)
+	}
+
+	hits := r.semantic.search(vec, limit, minScore)
+
+	result := &GrepResult{
+		Success:   true,
+		Summaries: make([]GrepSummaryResult, 0),
+		Messages:  make([]GrepMessageResult, 0),
+	}
+	for _, h := range hits {
+		msg, err := r.store.GetMessageByID(ctx, h.MessageID)
+		if err != nil {
+			continue
+		}
+		if input.ConversationID > 0 && !input.AllConversations && msg.ConversationID != input.ConversationID {
+			continue
+		}
+		result.Messages = append(result.Messages, GrepMessageResult{
+			ID:             msg.ID,
+			Snippet:        semanticSnippet(msg.Content),
+			Role:           msg.Role,
+			ConversationID: msg.ConversationID,
+			Rank:           h.Score,
+		})
+		result.TotalMessages = len(result.Messages)
+	}
+
+	if len(result.Messages) == 0 {
+		result.Hint = "No semantic matches above the score threshold. Try lowering min_score, or use short_grep for exact keywords."
+	}
 	return result, nil
 }
