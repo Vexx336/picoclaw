@@ -198,6 +198,24 @@ func (p *Pipeline) routeMediaTurn(ts *turnState, exec *turnExecution) error {
 	return nil
 }
 
+// candidateProviderFromMap resolves the registered provider for a resolved
+// fallback candidate. The runtime provider/model key is the most specific
+// identity (and the one explicit registrations/overrides use), so probe it
+// first; fall back to the config-level candidateProviderKey and finally the
+// StableKey for registrations that only used one scheme.
+func candidateProviderFromMap(providersByKey map[string]providers.LLMProvider, candidate providers.FallbackCandidate) providers.LLMProvider {
+	if providersByKey == nil {
+		return nil
+	}
+	if p := providersByKey[providers.ModelKey(candidate.Provider, candidate.Model)]; p != nil {
+		return p
+	}
+	if p := providersByKey[candidateProviderKey(candidate)]; p != nil {
+		return p
+	}
+	return providersByKey[candidate.StableKey()]
+}
+
 func modelConfigLooksVisionCapable(mc *config.ModelConfig) bool {
 	if mc == nil {
 		return false
@@ -283,10 +301,10 @@ func (p *Pipeline) recoverVisionRouting(ts *turnState, exec *turnExecution) bool
 		if resolved[0].StableKey() == currentKey {
 			continue
 		}
-		provider, ok := ts.agent.CandidateProviders[resolved[0].StableKey()]
-		if !ok || provider == nil {
+		provider := candidateProviderFromMap(ts.agent.CandidateProviders, resolved[0])
+		if provider == nil {
 			populateCandidateProvidersFromNames(p.Cfg, ts.agent.Workspace, []string{name}, ts.agent.CandidateProviders)
-			provider = ts.agent.CandidateProviders[resolved[0].StableKey()]
+			provider = candidateProviderFromMap(ts.agent.CandidateProviders, resolved[0])
 		}
 		if provider == nil {
 			continue

@@ -7921,6 +7921,11 @@ func TestAgentLoop_VisionUnsupportedErrorReroutesToAlternateImageModel(t *testin
 	successProvider := &visionRerouteSuccessProvider{}
 	agent.CandidateProviders[providers.ModelKey("openai", "broken-vision-model")] = textProvider
 	agent.CandidateProviders[providers.ModelKey("openai", "gpt-5.4")] = successProvider
+	for _, cand := range agent.ImageCandidates {
+		if providers.NormalizeProvider(cand.Provider) == "openai" && strings.TrimSpace(cand.Model) == "gpt-5.4" {
+			agent.CandidateProviders[candidateProviderKey(cand)] = successProvider
+		}
+	}
 
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), responseTimeout)
 	defer cancel()
