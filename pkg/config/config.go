@@ -270,6 +270,56 @@ type AgentsConfig struct {
 	Defaults AgentDefaults   `json:"defaults"`
 	List     []AgentConfig   `json:"list,omitempty"`
 	Dispatch *DispatchConfig `json:"dispatch,omitempty"`
+	// Description is a human-readable note shown in the launcher agent-tree
+	// selector. Only meaningful for named profiles (top-level live agents
+	// block usually leaves it empty).
+	Description string `json:"description,omitempty"`
+	// Profiles holds named agent-tree presets. Each profile carries a full
+	// AgentsConfig (defaults + list + dispatch) plus an optional description.
+	// When the user switches agent trees from the launcher, the target profile
+	// is copied into the live Agents block so the whole routing tree changes
+	// atomically. ActiveProfile records which profile is currently applied.
+	Profiles      map[string]AgentsConfig `json:"profiles,omitempty"`
+	ActiveProfile string                  `json:"active_profile,omitempty"`
+}
+
+// ApplyProfile switches the live agents block to the named profile. It returns
+// true when the profile exists and was applied. When the profile is missing,
+// the live agents block is left untouched and false is returned.
+func (c *AgentsConfig) ApplyProfile(name string) bool {
+	if c == nil {
+		return false
+	}
+	profile, ok := c.Profiles[name]
+	if !ok {
+		return false
+	}
+	c.Defaults = profile.Defaults
+	c.List = append([]AgentConfig(nil), profile.List...)
+	c.Dispatch = profile.Dispatch
+	c.ActiveProfile = name
+	return true
+}
+
+// Clone returns a deep copy of the agents block. The copy is safe to mutate
+// (slices and maps are copied), which keeps profile application atomic even
+// if a caller later edits the live agents block.
+func (c AgentsConfig) Clone() AgentsConfig {
+	out := c
+	out.List = append([]AgentConfig(nil), c.List...)
+	if c.Dispatch != nil {
+		d := *c.Dispatch
+		d.Rules = append([]DispatchRule(nil), c.Dispatch.Rules...)
+		out.Dispatch = &d
+	}
+	if c.Profiles != nil {
+		out.Profiles = make(map[string]AgentsConfig, len(c.Profiles))
+		for k, v := range c.Profiles {
+			v.List = append([]AgentConfig(nil), v.List...)
+			out.Profiles[k] = v
+		}
+	}
+	return out
 }
 
 // AgentModelConfig supports both string and structured model config.
