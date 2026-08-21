@@ -162,6 +162,22 @@ func NewEngine(config Config, completeFn CompleteFn) (*Engine, error) {
 		return nil, fmt.Errorf("set synchronous: %w", err)
 	}
 
+	// Performance tuning for large DBs (seahorse.db ~280MB): the default 2MB
+	// page cache + unbounded connection pool caused a pread64 syscall storm
+	// (~158k reads/5s) that pegged a core and blocked HTTP serving. Give the
+	// DB a real cache, memory-map reads, and bound the pool.
+	if _, err := db.Exec("PRAGMA cache_size = -64000;"); err != nil { // 64MB
+		_ = db.Close()
+		return nil, fmt.Errorf("set cache_size: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA mmap_size = 268435456;"); err != nil { // 256MB
+		_ = db.Close()
+		return nil, fmt.Errorf("set mmap_size: %w", err)
+	}
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
 	if err := runSchema(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrations: %w", err)
