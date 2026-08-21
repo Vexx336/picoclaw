@@ -222,16 +222,25 @@ func NewEngine(config Config, completeFn CompleteFn) (*Engine, error) {
 	}, nil
 }
 
-// sqliteDSN returns a DSN for config.DBPath with foreign keys enabled so the
-// message_embeddings table cascades deletes with its parent messages row.
+// sqliteDSN returns a DSN for config.DBPath with connection-level pragmas
+// applied to EVERY pooled connection (database/sql opens new connections
+// lazily; pragmas set via db.Exec only affect the first one). The cache and
+// mmap settings are critical for the ~280MB seahorse.db: without them the
+// default 2MB page cache causes a pread64 syscall storm that pegs a core.
 func sqliteDSN(path string) string {
 	if path == ":memory:" || strings.Contains(path, "_pragma=") {
 		return path
 	}
+	const pragmas = "_pragma=foreign_keys(1)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=cache_size(-64000)" +
+		"&_pragma=mmap_size(268435456)"
 	if strings.Contains(path, "?") {
-		return path + "&_pragma=foreign_keys(1)"
+		return path + "&" + pragmas
 	}
-	return path + "?_pragma=foreign_keys(1)"
+	return path + "?" + pragmas
 }
 
 // compileSessionPattern converts a glob pattern to a compiled regex.

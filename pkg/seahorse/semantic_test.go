@@ -460,9 +460,15 @@ func TestSemanticNormalizeEndpoint(t *testing.T) {
 }
 
 func TestSQLiteDSN(t *testing.T) {
+	all := "?_pragma=foreign_keys(1)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=cache_size(-64000)" +
+		"&_pragma=mmap_size(268435456)"
 	cases := []struct{ in, want string }{
-		{"/tmp/x.db", "/tmp/x.db?_pragma=foreign_keys(1)"},
-		{"file:/tmp/x.db?mode=rwc", "file:/tmp/x.db?mode=rwc&_pragma=foreign_keys(1)"},
+		{"/tmp/x.db", "/tmp/x.db" + all},
+		{"file:/tmp/x.db?mode=rwc", "file:/tmp/x.db?mode=rwc&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-64000)&_pragma=mmap_size(268435456)"},
 		{":memory:", ":memory:"},
 		{"/tmp/x.db?_pragma=foreign_keys(1)", "/tmp/x.db?_pragma=foreign_keys(1)"},
 	}
