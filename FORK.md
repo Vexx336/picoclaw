@@ -1,0 +1,43 @@
+# ⚠️ THIS IS THE CUSTOM PICOCLAW FORK — DO NOT OVERWRITE
+
+**Directory:** `/home/ubuntu/picoclawlocal/picoclaw-fork` (renamed from `picoclaw-src` on 2026-08-21)
+
+This repo is **NOT** a plain checkout of upstream `sipeed/picoclaw`.
+It contains custom, LOCAL-ONLY commits that are required for the live
+gateway on this host. Building from a fresh upstream clone or pulling
+upstream over these changes will break the live config
+(`agents.profiles` / `agents.active_profile` / seahorse semantic memory /
+vision reroute / launcher Advanced Settings).
+
+**Never:**
+- `git reset --hard` / `git checkout` to upstream refs
+- `git pull origin main` without rebasing our custom commits
+- Build the gateway from a fresh clone of `https://github.com/sipeed/picoclaw`
+- Delete or rename this directory without updating `rebuild-fork.sh`
+
+**Always:**
+- Build ONLY from this fork (see `rebuild-fork.sh` at `/home/ubuntu/picoclawlocal/`)
+- Read `memory/OPERATIONS.md` + skill `picoclaw-agent` before touching the gateway
+- Swap binaries via detached `systemd-run` jobs — never `systemctl stop/restart` from a live chat session (it kills the session mid-swap; caused 37-min outage on 08-20)
+
+---
+
+## Custom commits (relative to origin/main @ 49183d7e)
+
+| Commit | Description |
+|---|---|
+| `12bba29b` | feat(embeddings): add pkg/embeddings client, index, store (M1) |
+| `0cde38fa` | feat(seahorse): semantic memory integration (M2) |
+| `a2900ce7` | test(seahorse): live semantic smoke test vs skynet embed server |
+| `e2a43f17` | feat(agent): auto-reroute image turns to alternate vision models |
+| `36a079a3` | fix(agent): align vision reroute provider lookup with candidate keying |
+| `962a5464` | feat(config): port agent-tree profiles/active_profile from dirty binary |
+| `63b39732` | feat(launcher): add Advanced Settings page (agent-tree profiles UI) |
+
+All custom work is also saved as patch files in
+`/home/ubuntu/picoclawlocal/workspace/picoclaw-fork-patches/`
+(backed up to gdrive). To rebuild the fork from a fresh upstream clone:
+`git am patches/*.patch`
+
+## Tags
+- `custom-20260821` — fork state after the 2026-08-21 separation (all custom commits + FORK.md)
