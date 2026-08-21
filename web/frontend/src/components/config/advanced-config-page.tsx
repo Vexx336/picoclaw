@@ -324,14 +324,16 @@ export function AdvancedConfigPage() {
                   layout="setting-row"
                 >
                   <Select
-                    value={contextManager}
-                    onValueChange={setContextManager}
+                    value={contextManager === "" ? "__default__" : contextManager}
+                    onValueChange={(v) =>
+                      setContextManager(v === "__default__" ? "" : v)
+                    }
                   >
                     <SelectTrigger className="h-9">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="">
+                      <SelectItem value="__default__">
                         {t("pages.config_advanced.context_manager_default")}
                       </SelectItem>
                       <SelectItem value="seahorse">
