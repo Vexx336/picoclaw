@@ -65,6 +65,14 @@ type SessionMeta struct {
 type JSONLStore struct {
 	dir   string
 	locks [numLockShards]sync.Mutex
+
+	// metaCache caches the directory scan of *.meta.json files (canonical key
+	// -> SessionMeta). Without it, ResolveSessionKey/ListSessions re-read the
+	// whole directory on EVERY call, making the startup session bootstrap
+	// O(n²) — ~1.9k sessions meant ~3.4M file reads before serving HTTP.
+	metaMu    sync.RWMutex
+	metaCache map[string]SessionMeta
+	metaBuilt bool
 }
 
 // NewJSONLStore creates a new JSONL-backed store rooted at dir.
@@ -136,7 +144,67 @@ func (s *JSONLStore) writeMeta(key string, meta SessionMeta) error {
 	if err != nil {
 		return fmt.Errorf("memory: encode meta: %w", err)
 	}
-	return fileutil.WriteFileAtomic(s.metaPath(key), data, 0o644)
+	if err := fileutil.WriteFileAtomic(s.metaPath(key), data, 0o644); err != nil {
+		return err
+	}
+	s.invalidateMetaCache()
+	return nil
+}
+
+// metaIndex returns the canonical-key -> SessionMeta map, building it lazily
+// from *.meta.json files on first use. The O(n) directory scan happens at most
+// once between writes; all subsequent lookups hit the in-memory map.
+func (s *JSONLStore) metaIndex() map[string]SessionMeta {
+	s.metaMu.RLock()
+	if s.metaBuilt {
+		defer s.metaMu.RUnlock()
+		return s.metaCache
+	}
+	s.metaMu.RUnlock()
+
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	if s.metaBuilt {
+		return s.metaCache
+	}
+
+	idx := make(map[string]SessionMeta)
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		s.metaCache = idx
+		s.metaBuilt = true
+		return idx
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(s.dir, entry.Name()))
+		if readErr != nil {
+			log.Printf("memory: skipping unreadable meta %s: %v", entry.Name(), readErr)
+			continue
+		}
+		var meta SessionMeta
+		if err := json.Unmarshal(data, &meta); err != nil {
+			log.Printf("memory: skipping corrupt meta %s: %v", entry.Name(), err)
+			continue
+		}
+		if meta.Key == "" {
+			continue
+		}
+		idx[meta.Key] = meta
+	}
+	s.metaCache = idx
+	s.metaBuilt = true
+	return idx
+}
+
+// invalidateMetaCache drops the cached meta index so the next lookup rescans.
+func (s *JSONLStore) invalidateMetaCache() {
+	s.metaMu.Lock()
+	s.metaBuilt = false
+	s.metaCache = nil
+	s.metaMu.Unlock()
 }
 
 func cloneRawJSON(data json.RawMessage) json.RawMessage {
@@ -303,40 +371,15 @@ func (s *JSONLStore) ResolveSessionKey(_ context.Context, sessionKey string) (st
 		return sessionKey, true, nil
 	}
 
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return "", false, fmt.Errorf("memory: read sessions dir: %w", err)
-	}
-
 	var directMetaMatch string
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
-			continue
-		}
-
-		data, readErr := os.ReadFile(filepath.Join(s.dir, entry.Name()))
-		if readErr != nil {
-			log.Printf("memory: skipping unreadable meta %s: %v", entry.Name(), readErr)
-			continue
-		}
-
-		var meta SessionMeta
-		if err := json.Unmarshal(data, &meta); err != nil {
-			log.Printf("memory: skipping corrupt meta %s: %v", entry.Name(), err)
-			continue
-		}
-
-		if meta.Key == "" {
-			continue
-		}
-
-		if meta.Key == sessionKey {
-			directMetaMatch = meta.Key
+	for canonicalKey, meta := range s.metaIndex() {
+		if canonicalKey == sessionKey {
+			directMetaMatch = canonicalKey
 		}
 
 		for _, alias := range meta.Aliases {
-			if alias == sessionKey && meta.Key != sessionKey {
-				return meta.Key, true, nil
+			if alias == sessionKey && canonicalKey != sessionKey {
+				return canonicalKey, true, nil
 			}
 		}
 	}
@@ -851,29 +894,12 @@ func (s *JSONLStore) rewriteJSONL(
 	return fileutil.WriteFileAtomic(s.jsonlPath(sessionKey), buf.Bytes(), 0o644)
 }
 
-// ListSessions returns all known session keys by reading .meta.json files.
+// ListSessions returns all known session keys, using the cached meta index.
 func (s *JSONLStore) ListSessions() []string {
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return nil
-	}
-	var keys []string
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
-			continue
-		}
-		// Read the meta file to get the original key
-		data, err := os.ReadFile(filepath.Join(s.dir, entry.Name()))
-		if err != nil {
-			continue
-		}
-		var meta SessionMeta
-		if err := json.Unmarshal(data, &meta); err != nil {
-			continue
-		}
-		if meta.Key != "" {
-			keys = append(keys, meta.Key)
-		}
+	idx := s.metaIndex()
+	keys := make([]string, 0, len(idx))
+	for key := range idx {
+		keys = append(keys, key)
 	}
 	return keys
 }
