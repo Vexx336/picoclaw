@@ -35,7 +35,7 @@ interface GenericFormProps {
 }
 
 // Fields to skip in the generic form (handled by enabled toggle or internal).
-const SKIP_FIELDS = new Set(["enabled", "reasoning_channel_id"])
+const SKIP_FIELDS = new Set(["enabled", "reasoning_channel_id", "tool_channel_id"])
 
 // Fields that are objects/nested — show as JSON or skip.
 const OBJECT_FIELDS = new Set([

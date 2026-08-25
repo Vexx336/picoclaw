@@ -162,6 +162,9 @@ func addChannelCommonConfig(settings map[string]any, bc *config.Channel) {
 	if bc.ReasoningChannelID != "" {
 		settings["reasoning_channel_id"] = bc.ReasoningChannelID
 	}
+	if bc.ToolChannelID != "" {
+		settings["tool_channel_id"] = bc.ToolChannelID
+	}
 	if bc.GroupTrigger.MentionOnly || len(bc.GroupTrigger.Prefixes) > 0 {
 		settings["group_trigger"] = bc.GroupTrigger
 	}

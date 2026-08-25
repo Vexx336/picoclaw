@@ -98,6 +98,7 @@ const CHANNEL_COMMON_CONFIG_KEYS = new Set([
   "group_trigger",
   "placeholder",
   "reasoning_channel_id",
+  "tool_channel_id",
   "typing",
 ])
 

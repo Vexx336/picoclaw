@@ -53,6 +53,7 @@ type Channel interface {
 	IsAllowed(senderID string) bool
 	IsAllowedSender(sender bus.SenderInfo) bool
 	ReasoningChannelID() string
+	ToolChannelID() string
 }
 
 // BaseChannelOption is a functional option for configuring a BaseChannel.
@@ -75,6 +76,11 @@ func WithReasoningChannelID(id string) BaseChannelOption {
 	return func(c *BaseChannel) { c.reasoningChannelID = id }
 }
 
+// WithToolChannelID sets the tool-feedback channel ID where tool calls should be sent.
+func WithToolChannelID(id string) BaseChannelOption {
+	return func(c *BaseChannel) { c.toolChannelID = id }
+}
+
 // MessageLengthProvider is an opt-in interface that channels implement
 // to advertise their maximum message length. The Manager uses this via
 // type assertion to decide whether to split outbound messages.
@@ -94,6 +100,7 @@ type BaseChannel struct {
 	placeholderRecorder PlaceholderRecorder
 	owner               Channel // the concrete channel that embeds this BaseChannel
 	reasoningChannelID  string
+	toolChannelID       string
 }
 
 func NewBaseChannel(
@@ -195,6 +202,10 @@ func (c *BaseChannel) SetName(name string) {
 
 func (c *BaseChannel) ReasoningChannelID() string {
 	return c.reasoningChannelID
+}
+
+func (c *BaseChannel) ToolChannelID() string {
+	return c.toolChannelID
 }
 
 func (c *BaseChannel) IsRunning() bool {

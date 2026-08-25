@@ -86,6 +86,7 @@ func NewDiscordChannel(
 		channels.WithMaxMessageLength(2000),
 		channels.WithGroupTrigger(bc.GroupTrigger),
 		channels.WithReasoningChannelID(bc.ReasoningChannelID),
+		channels.WithToolChannelID(bc.ToolChannelID),
 	)
 
 	ch := &DiscordChannel{
@@ -176,6 +177,10 @@ func (c *DiscordChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]s
 	}
 
 	isToolFeedback := outboundMessageIsToolFeedback(msg)
+	if isToolFeedback {
+		// Route tool-feedback messages to the dedicated tool channel when configured.
+		channelID = c.toolFeedbackChannelID(channelID)
+	}
 	if isToolFeedback {
 		if msgID, handled, err := c.progress.Update(ctx, channelID, msg.Content); handled {
 			if err != nil {
@@ -434,6 +439,13 @@ func (c *DiscordChannel) DismissToolFeedbackMessage(ctx context.Context, chatID 
 		return
 	}
 	c.dismissTrackedToolFeedbackMessage(ctx, chatID, msgID)
+	// If tool feedback was routed to a dedicated channel, dismiss it there too.
+	toolID := c.toolFeedbackChannelID(chatID)
+	if toolID != chatID {
+		if msgID, ok := c.currentToolFeedbackMessage(toolID); ok {
+			c.dismissTrackedToolFeedbackMessage(ctx, toolID, msgID)
+		}
+	}
 }
 
 func (c *DiscordChannel) dismissTrackedToolFeedbackMessage(ctx context.Context, chatID, messageID string) {
@@ -465,7 +477,29 @@ func (c *DiscordChannel) FinalizeToolFeedbackMessage(ctx context.Context, msg bu
 	if outboundMessageIsToolFeedback(msg) {
 		return nil, false
 	}
-	return c.finalizeTrackedToolFeedbackMessage(ctx, msg.ChatID, msg.Content, c.EditMessage)
+	// Normal path: finalize (edit in place) any tracked tool feedback in the same chat.
+	if msgIDs, handled := c.finalizeTrackedToolFeedbackMessage(ctx, msg.ChatID, msg.Content, c.EditMessage); handled {
+		return msgIDs, true
+	}
+	// Tool-channel path: if tool feedback was routed to a dedicated channel,
+	// dismiss (delete) the tracked message there now that the turn is complete.
+	toolID := c.toolFeedbackChannelID(msg.ChatID)
+	if toolID != msg.ChatID {
+		if msgID, ok := c.currentToolFeedbackMessage(toolID); ok {
+			c.dismissTrackedToolFeedbackMessage(ctx, toolID, msgID)
+		}
+	}
+	return nil, false
+}
+
+// toolFeedbackChannelID returns the channel where tool-feedback messages should
+// be delivered. When a dedicated tool channel is configured it is used for all
+// tool-feedback output; otherwise the original chat is used.
+func (c *DiscordChannel) toolFeedbackChannelID(chatID string) string {
+	if c.bc != nil && c.bc.ToolChannelID != "" {
+		return c.bc.ToolChannelID
+	}
+	return chatID
 }
 
 func (c *DiscordChannel) sendChunk(ctx context.Context, channelID, content, replyToID string) (string, error) {
