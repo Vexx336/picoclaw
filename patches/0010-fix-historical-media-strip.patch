@@ -1,0 +1,15 @@
+diff --git a/pkg/agent/agent_media.go b/pkg/agent/agent_media.go
+index deee11cb..2a605043 100644
+--- a/pkg/agent/agent_media.go
++++ b/pkg/agent/agent_media.go
+@@ -94,6 +94,10 @@ func resolveMediaRefs(
+ 
+ 		for _, ref := range m.Media {
+ 			if !strings.HasPrefix(ref, "media://") {
++				if idx < currentTurnStart {
++					// Historical data URLs should not be passed to LLM
++					continue
++				}
+ 				resolved = append(resolved, ref)
+ 				continue
+ 			}

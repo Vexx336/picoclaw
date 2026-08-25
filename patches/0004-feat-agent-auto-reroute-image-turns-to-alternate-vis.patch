@@ -1,0 +1,360 @@
+From e2a43f17ed9b43ac68a7eef45f1858d45ef3ad83 Mon Sep 17 00:00:00 2001
+From: Jesse Lemay <thewhiterhino1420@gmail.com>
+Date: Tue, 11 Aug 2026 11:59:02 +0000
+Subject: [PATCH 4/8] feat(agent): auto-reroute image turns to alternate vision
+ models
+
+When a vision-capable model is configured but the active route returns
+'No endpoints found that support image input', automatically recover
+by switching to image_model_fallbacks or any multimodal model in the
+model list instead of failing the turn.
+
+- recoverVisionRouting: picks first viable alternate model, resolves
+  provider, swaps active candidate, emits AgentLLMRetry event
+- modelConfigLooksVisionCapable: heuristic for gpt-4o/gpt-4.1/gpt-5,
+  claude-3+/opus/sonnet-4, gemini, vision, multimodal, vl
+- visionUnsupportedModelError: clearer guidance naming image_model and
+  image_model_fallbacks
+- tests: reroute to fallback model carries media refs and returns result
+---
+ pkg/agent/agent_test.go   | 122 ++++++++++++++++++++++++++++++++++
+ pkg/agent/llm_media.go    | 134 ++++++++++++++++++++++++++++++++++++--
+ pkg/agent/pipeline_llm.go |  21 ++++++
+ 3 files changed, 273 insertions(+), 4 deletions(-)
+
+diff --git a/pkg/agent/agent_test.go b/pkg/agent/agent_test.go
+index bc3d8552..f485d80a 100644
+--- a/pkg/agent/agent_test.go
++++ b/pkg/agent/agent_test.go
+@@ -7834,3 +7834,125 @@ func TestRunWorkerPanicReleasesSessionTurnState(t *testing.T) {
+ 		time.Sleep(10 * time.Millisecond)
+ 	}
+ }
++
++type visionRerouteTextProvider struct {
++	calls int
++}
++
++func (p *visionRerouteTextProvider) Chat(
++	ctx context.Context,
++	messages []providers.Message,
++	tools []providers.ToolDefinition,
++	model string,
++	opts map[string]any,
++) (*providers.LLMResponse, error) {
++	p.calls++
++	return nil, fmt.Errorf("API request failed: Status: 400 Body: {\"error\":{\"message\":\"No endpoints found that support image input\"}}")
++}
++
++func (p *visionRerouteTextProvider) GetDefaultModel() string {
++	return "vision-reroute-text-model"
++}
++
++type visionRerouteSuccessProvider struct {
++	calls     int
++	models    []string
++	mediaSeen []bool
++}
++
++func (p *visionRerouteSuccessProvider) Chat(
++	ctx context.Context,
++	messages []providers.Message,
++	tools []providers.ToolDefinition,
++	model string,
++	opts map[string]any,
++) (*providers.LLMResponse, error) {
++	p.calls++
++	p.models = append(p.models, model)
++	seenMedia := false
++	for _, msg := range messages {
++		for _, ref := range msg.Media {
++			if strings.TrimSpace(ref) != "" {
++				seenMedia = true
++				break
++			}
++		}
++		if seenMedia {
++			break
++		}
++	}
++	p.mediaSeen = append(p.mediaSeen, seenMedia)
++	return &providers.LLMResponse{Content: "rerouted vision answer"}, nil
++}
++
++func (p *visionRerouteSuccessProvider) GetDefaultModel() string {
++	return "vision-reroute-success-model"
++}
++
++func TestAgentLoop_VisionUnsupportedErrorReroutesToAlternateImageModel(t *testing.T) {
++	workspace := t.TempDir()
++
++	cfg := &config.Config{
++		Agents: config.AgentsConfig{
++			Defaults: config.AgentDefaults{
++				Workspace:           workspace,
++				ModelName:           "text-model",
++				ImageModel:          "broken-vision-model",
++				ImageModelFallbacks: []string{"gpt-5.4"},
++				MaxTokens:           4096,
++				MaxToolIterations:   3,
++			},
++		},
++		ModelList: []*config.ModelConfig{
++			{ModelName: "text-model", Model: "openai/text-model"},
++			{ModelName: "broken-vision-model", Provider: "openai", Model: "broken-vision-model"},
++			{ModelName: "gpt-5.4", Provider: "openai", Model: "gpt-5.4"},
++		},
++	}
++
++	msgBus := bus.NewMessageBus()
++	textProvider := &visionRerouteTextProvider{}
++	al := NewAgentLoop(cfg, msgBus, textProvider)
++
++	agent := al.registry.GetDefaultAgent()
++	if agent == nil {
++		t.Fatal("expected default agent")
++	}
++	successProvider := &visionRerouteSuccessProvider{}
++	agent.CandidateProviders[providers.ModelKey("openai", "broken-vision-model")] = textProvider
++	agent.CandidateProviders[providers.ModelKey("openai", "gpt-5.4")] = successProvider
++
++	timeoutCtx, cancel := context.WithTimeout(context.Background(), responseTimeout)
++	defer cancel()
++
++	resp, err := al.processMessage(timeoutCtx, testInboundMessage(bus.InboundMessage{
++		Context: bus.InboundContext{
++			Channel:   "telegram",
++			ChatID:    "chat1",
++			ChatType:  "direct",
++			SenderID:  "user1",
++			MessageID: "m1",
++		},
++		Content:    "describe this",
++		Media:      []string{"media://example"},
++		SessionKey: "agent:main:telegram:direct:user1",
++	}))
++	if err != nil {
++		t.Fatalf("processMessage() error = %v", err)
++	}
++	if resp != "rerouted vision answer" {
++		t.Fatalf("response = %q, want %q", resp, "rerouted vision answer")
++	}
++	if textProvider.calls != 1 {
++		t.Fatalf("textProvider calls = %d, want 1", textProvider.calls)
++	}
++	if successProvider.calls != 1 {
++		t.Fatalf("successProvider calls = %d, want 1", successProvider.calls)
++	}
++	if !slices.Equal(successProvider.models, []string{"gpt-5.4"}) {
++		t.Fatalf("successProvider models = %v, want %v", successProvider.models, []string{"gpt-5.4"})
++	}
++	if !slices.Equal(successProvider.mediaSeen, []bool{true}) {
++		t.Fatalf("successProvider mediaSeen = %v, want %v", successProvider.mediaSeen, []bool{true})
++	}
++}
+diff --git a/pkg/agent/llm_media.go b/pkg/agent/llm_media.go
+index 69dd1806..5ea91291 100644
+--- a/pkg/agent/llm_media.go
++++ b/pkg/agent/llm_media.go
+@@ -5,6 +5,7 @@ import (
+ 	"regexp"
+ 	"strings"
+ 
++	"github.com/sipeed/picoclaw/pkg/config"
+ 	"github.com/sipeed/picoclaw/pkg/logger"
+ 	"github.com/sipeed/picoclaw/pkg/providers"
+ )
+@@ -73,25 +74,30 @@ func isVisionUnsupportedError(err error) bool {
+ 
+ func visionUnsupportedModelError(modelName string, imageModelConfigured bool) error {
+ 	modelName = strings.TrimSpace(modelName)
++	guidance := "update agents.defaults.image_model (or image_model_fallbacks) to a multimodal model such as gpt-5.4, gpt-4o, claude-sonnet-4.6, or gemini-2.0-flash"
+ 	if imageModelConfigured {
+ 		if modelName != "" {
+ 			return fmt.Errorf(
+-				"selected vision model %q does not support image input; update agents.defaults.image_model to a multimodal model",
++				"selected vision model %q does not support image input; %s",
+ 				modelName,
++				guidance,
+ 			)
+ 		}
+ 		return fmt.Errorf(
+-			"selected vision model does not support image input; update agents.defaults.image_model to a multimodal model",
++			"selected vision model does not support image input; %s",
++			guidance,
+ 		)
+ 	}
+ 	if modelName != "" {
+ 		return fmt.Errorf(
+-			"active model %q does not support image input; configure agents.defaults.image_model with a multimodal model",
++			"active model %q does not support image input; %s",
+ 			modelName,
++			guidance,
+ 		)
+ 	}
+ 	return fmt.Errorf(
+-		"the active model does not support image input; configure agents.defaults.image_model with a multimodal model",
++		"the active model does not support image input; %s",
++		guidance,
+ 	)
+ }
+ 
+@@ -191,3 +197,123 @@ func (p *Pipeline) routeMediaTurn(ts *turnState, exec *turnExecution) error {
+ 
+ 	return nil
+ }
++
++func modelConfigLooksVisionCapable(mc *config.ModelConfig) bool {
++	if mc == nil {
++		return false
++	}
++	parts := []string{
++		strings.TrimSpace(mc.ModelName),
++		strings.TrimSpace(mc.Model),
++		strings.TrimSpace(mc.Provider),
++	}
++	combined := strings.ToLower(strings.Join(parts, " "))
++	if combined == "" {
++		return false
++	}
++	visionHints := []string{
++		"gpt-4o",
++		"gpt-4.1",
++		"gpt-5",
++		"claude-3",
++		"claude-opus-4",
++		"claude-sonnet-4",
++		"gemini",
++		"vision",
++		"multimodal",
++		"vl",
++	}
++	for _, hint := range visionHints {
++		if strings.Contains(combined, hint) {
++			return true
++		}
++	}
++	return false
++}
++
++func (p *Pipeline) recoverVisionRouting(ts *turnState, exec *turnExecution) bool {
++	if p == nil || p.Cfg == nil || ts == nil || ts.agent == nil || exec == nil {
++		return false
++	}
++	if !messagesContainCurrentTurnMediaTurn(currentTurnMessages(exec.callMessages, exec.currentTurnStart)) {
++		return false
++	}
++
++	currentKey := ""
++	if len(exec.activeCandidates) > 0 {
++		currentKey = exec.activeCandidates[0].StableKey()
++	} else {
++		currentKey = providers.ModelKey(
++			resolvedCandidateProvider(exec.activeCandidates, p.Cfg.Agents.Defaults.Provider),
++			resolvedCandidateModel(exec.activeCandidates, exec.activeModel),
++		)
++	}
++
++	candidateNames := make([]string, 0, 8)
++	seenNames := make(map[string]bool)
++	addName := func(name string) {
++		name = strings.TrimSpace(name)
++		if name == "" || seenNames[name] {
++			return
++		}
++		seenNames[name] = true
++		candidateNames = append(candidateNames, name)
++	}
++
++	for _, name := range p.Cfg.Agents.Defaults.ImageModelFallbacks {
++		addName(name)
++	}
++	for _, mc := range p.Cfg.ModelList {
++		if !modelConfigLooksVisionCapable(mc) {
++			continue
++		}
++		addName(strings.TrimSpace(mc.ModelName))
++	}
++
++	for _, name := range candidateNames {
++		resolved := resolveModelCandidates(
++			p.Cfg,
++			p.Cfg.Agents.Defaults.Provider,
++			name,
++			nil,
++		)
++		if len(resolved) == 0 {
++			continue
++		}
++		if resolved[0].StableKey() == currentKey {
++			continue
++		}
++		provider, ok := ts.agent.CandidateProviders[resolved[0].StableKey()]
++		if !ok || provider == nil {
++			populateCandidateProvidersFromNames(p.Cfg, ts.agent.Workspace, []string{name}, ts.agent.CandidateProviders)
++			provider = ts.agent.CandidateProviders[resolved[0].StableKey()]
++		}
++		if provider == nil {
++			continue
++		}
++
++		exec.activeCandidates = resolved
++		exec.activeModel = resolvedCandidateModel(resolved, name)
++		exec.activeProvider = provider
++		exec.activeModelConfig = resolveActiveModelConfig(
++			p.Cfg,
++			ts.agent.Workspace,
++			resolved,
++			exec.activeModel,
++			p.Cfg.Agents.Defaults.Provider,
++		)
++		exec.llmModelName = resolvedCandidateModelName(resolved, name)
++		exec.llmModel = exec.activeModel
++		exec.usedLight = false
++
++		logger.WarnCF("agent", "Recovered media turn by switching to alternate multimodal model", map[string]any{
++			"agent_id":       ts.agent.ID,
++			"recovered_from": currentKey,
++			"recovered_to":   resolved[0].StableKey(),
++			"model_name":     exec.llmModelName,
++		})
++		return true
++	}
++
++	return false
++}
+diff --git a/pkg/agent/pipeline_llm.go b/pkg/agent/pipeline_llm.go
+index acea5e23..20a520b8 100644
+--- a/pkg/agent/pipeline_llm.go
++++ b/pkg/agent/pipeline_llm.go
+@@ -317,6 +317,27 @@ func (p *Pipeline) CallLLM(
+ 		}
+ 
+ 		if hasMediaRefs(exec.callMessages) && isVisionUnsupportedError(err) {
++			if p.recoverVisionRouting(ts, exec) {
++				al.emitEvent(
++					runtimeevents.KindAgentLLMRetry,
++					ts.eventMeta("runTurn", "turn.llm.retry"),
++					LLMRetryPayload{
++						Attempt:    retry + 1,
++						MaxRetries: maxRetries,
++						Reason:     "vision_model_reroute",
++						Error:      err.Error(),
++						Backoff:    0,
++					},
++				)
++				logger.WarnCF("agent", "Vision model unsupported; rerouting media turn to alternate multimodal model", map[string]any{
++					"agent_id":  ts.agent.ID,
++					"iteration": iteration,
++					"retry":     retry,
++					"error":     err.Error(),
++					"model":     exec.llmModelName,
++				})
++				continue
++			}
+ 			return ControlBreak, visionUnsupportedModelError(
+ 				exec.llmModelName,
+ 				len(ts.agent.ImageCandidates) > 0,
+-- 
+2.53.0
+

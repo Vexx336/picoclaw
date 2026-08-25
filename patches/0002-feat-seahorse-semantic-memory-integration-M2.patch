@@ -1,0 +1,1340 @@
+From 0cde38fa493d0bcd1a145f63e4fb7a444bba999d Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-15-227.ca-central-1.compute.internal>
+Date: Thu, 20 Aug 2026 16:13:31 -0400
+Subject: [PATCH 2/8] feat(seahorse): semantic memory integration (M2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Integrate pkg/embeddings into the seahorse context manager:
+
+- Config: enableSemantic, embeddingEndpoint (base URL or full /embeddings
+  path), embeddingModel, embeddingDim, topK, minScore, asyncWrite,
+  ignoreSessionsForEmbedding. Off by default; ValidateSemantic guards.
+- SemanticEngine (semantic.go): embeddings client + vector store
+  (message_embeddings table, FK cascade via _pragma=foreign_keys(1)) +
+  in-memory flat index loaded at startup. Async non-blocking Enqueue on
+  Ingest, PendingIDs-driven Backfill that resumes across restarts,
+  Close drains the worker. Failures log-and-drop (grep-only fallback).
+- Retrieval: Semantic(ctx, SemanticInput) embeds query, nearest-neighbor
+  search, returns GrepResult-shaped hits with cosine rank. Supports
+  allConversations (default true) and conversation scoping.
+- Tool: short_semantic — keyword-free memory recall, scopes to current
+  session when all_conversations=false via tools.ToolSessionKey(ctx).
+- Agent wiring: context_seahorse.go parses context_manager_config
+  (was ignored), registers short_semantic when enabled, starts
+  background backfill (2s delay, 45min cap).
+
+Tests: 11 new semantic tests (fake embed server, async ingest+search,
+tool+expand roundtrip, backfill idempotence, conversation scoping,
+endpoint normalization, DSN). go test + race clean.
+---
+ pkg/agent/context_seahorse.go   |  41 ++-
+ pkg/seahorse/semantic.go        | 302 ++++++++++++++++++++
+ pkg/seahorse/semantic_test.go   | 474 ++++++++++++++++++++++++++++++++
+ pkg/seahorse/short_engine.go    | 108 +++++++-
+ pkg/seahorse/short_retrieval.go |  73 +++++
+ pkg/seahorse/tool_semantic.go   | 133 +++++++++
+ 6 files changed, 1123 insertions(+), 8 deletions(-)
+ create mode 100644 pkg/seahorse/semantic.go
+ create mode 100644 pkg/seahorse/semantic_test.go
+ create mode 100644 pkg/seahorse/tool_semantic.go
+
+diff --git a/pkg/agent/context_seahorse.go b/pkg/agent/context_seahorse.go
+index 4e4c55fd..1b864582 100644
+--- a/pkg/agent/context_seahorse.go
++++ b/pkg/agent/context_seahorse.go
+@@ -24,7 +24,7 @@ type seahorseContextManager struct {
+ }
+ 
+ // newSeahorseContextManager creates a seahorse-backed ContextManager.
+-func newSeahorseContextManager(_ json.RawMessage, al *AgentLoop) (ContextManager, error) {
++func newSeahorseContextManager(raw json.RawMessage, al *AgentLoop) (ContextManager, error) {
+ 	if al == nil {
+ 		return nil, fmt.Errorf("seahorse: AgentLoop is required")
+ 	}
+@@ -34,13 +34,24 @@ func newSeahorseContextManager(_ json.RawMessage, al *AgentLoop) (ContextManager
+ 	agent := al.registry.GetDefaultAgent()
+ 	dbPath := agent.Workspace + "/sessions/seahorse.db"
+ 
++	// Parse context_manager_config (semantic memory settings etc.)
++	// Unknown fields are ignored; invalid JSON falls back to defaults.
++	var cfg seahorse.Config
++	if len(raw) > 0 {
++		if err := json.Unmarshal(raw, &cfg); err != nil {
++			logger.WarnCF("seahorse", "invalid context_manager_config; using defaults",
++				map[string]any{"error": err.Error()})
++		}
++	}
++	if cfg.DBPath == "" {
++		cfg.DBPath = dbPath
++	}
++
+ 	// Create CompleteFn from provider
+ 	completeFn := providerToCompleteFn(agent.Provider, agent.Model)
+ 
+ 	// Create engine
+-	engine, err := seahorse.NewEngine(seahorse.Config{
+-		DBPath: dbPath,
+-	}, completeFn)
++	engine, err := seahorse.NewEngine(cfg, completeFn)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("seahorse: create engine: %w", err)
+ 	}
+@@ -55,6 +66,10 @@ func newSeahorseContextManager(_ json.RawMessage, al *AgentLoop) (ContextManager
+ 	retrieval := mgr.engine.GetRetrieval()
+ 	al.RegisterTool(seahorse.NewGrepTool(retrieval))
+ 	al.RegisterTool(seahorse.NewExpandTool(retrieval))
++	if engine.SemanticEnabled() {
++		al.RegisterTool(seahorse.NewSemanticTool(retrieval))
++		mgr.startSemanticBackfill()
++	}
+ 
+ 	// Bootstrap all existing sessions at startup
+ 	if agent.Sessions != nil {
+@@ -67,6 +82,24 @@ func newSeahorseContextManager(_ json.RawMessage, al *AgentLoop) (ContextManager
+ 	return mgr, nil
+ }
+ 
++// startSemanticBackfill embeds historical messages that lack vectors. Runs in
++// the background after a short delay so the gateway boots fast; resumes on
++// restart until every message has a vector.
++func (m *seahorseContextManager) startSemanticBackfill() {
++	go func() {
++		time.Sleep(2 * time.Second)
++		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
++		defer cancel()
++		n, err := m.engine.SemanticBackfill(ctx, 16)
++		if err != nil && ctx.Err() == nil {
++			logger.WarnCF("seahorse", "semantic backfill stopped early (will resume on restart)",
++				map[string]any{"embedded": n, "error": err.Error()})
++		} else if err == nil {
++			logger.InfoCF("seahorse", "semantic backfill complete", map[string]any{"embedded": n})
++		}
++	}()
++}
++
+ // providerToCompleteFn wraps providers.LLMProvider as a seahorse.CompleteFn.
+ func providerToCompleteFn(provider providers.LLMProvider, model string) seahorse.CompleteFn {
+ 	return func(ctx context.Context, prompt string, opts seahorse.CompleteOptions) (string, error) {
+diff --git a/pkg/seahorse/semantic.go b/pkg/seahorse/semantic.go
+new file mode 100644
+index 00000000..26c22812
+--- /dev/null
++++ b/pkg/seahorse/semantic.go
+@@ -0,0 +1,302 @@
++package seahorse
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"fmt"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/sipeed/picoclaw/pkg/embeddings"
++	"github.com/sipeed/picoclaw/pkg/logger"
++)
++
++// Semantic memory (Tier 3, M2): embedding-based retrieval over the seahorse
++// message store. Vectors are produced by a dedicated embedding model served
++// by llama.cpp (skynet :18084), stored in the message_embeddings table next
++// to the seahorse tables, and searched with an in-memory flat index.
++//
++// The design is intentionally additive: when enableSemantic is false (the
++// default) none of this code runs and behavior is identical to pre-M2.
++// Failures degrade to grep-only — they never block message persistence.
++
++const (
++	// semanticQueueSize bounds the async embedding queue. Ingests are small
++	// (1-3 messages per turn), so a few hundred slots is plenty.
++	semanticQueueSize = 512
++	// maxEmbedTextLen caps per-message text sent to the embedding model.
++	maxEmbedTextLen = 2000
++	// defaultSemanticTopK / defaultSemanticMinScore apply when unset.
++	defaultSemanticTopK     = 8
++	defaultSemanticMinScore = 0.35
++)
++
++// SemanticEngine owns the embedding client, vector store, and in-memory
++// index for one Engine. All write paths are asynchronous so message
++// persistence never blocks on the network; failures are logged and dropped.
++type SemanticEngine struct {
++	db    *sql.DB
++	store *Store // seahorse store for message content/parts
++
++	client *embeddings.Client
++	estore *embeddings.Store
++	index  *embeddings.Index
++	cfg    Config
++
++	indexMu sync.RWMutex // guards index
++
++	// lifecycle guards queue + closed.
++	lifecycleMu sync.Mutex
++	queue       chan int64
++	closed      bool
++	wg          sync.WaitGroup
++}
++
++// newSemanticEngine builds the semantic engine: client, vector store
++// (migrates message_embeddings on the shared DB), and a loaded flat index.
++func newSemanticEngine(ctx context.Context, db *sql.DB, store *Store, cfg Config) (*SemanticEngine, error) {
++	endpoint := normalizeEmbeddingEndpoint(cfg.EmbeddingEndpoint)
++	if endpoint == "" {
++		return nil, errors.New("semantic: embeddingEndpoint is required")
++	}
++	if cfg.EmbeddingDim <= 0 {
++		return nil, errors.New("semantic: embeddingDim must be > 0")
++	}
++	if cfg.EmbeddingModel == "" {
++		cfg.EmbeddingModel = "default"
++	}
++
++	client := embeddings.NewClient(endpoint, cfg.EmbeddingModel, cfg.EmbeddingDim)
++	estore, err := embeddings.NewStore(ctx, db, cfg.EmbeddingModel, cfg.EmbeddingDim)
++	if err != nil {
++		return nil, fmt.Errorf("semantic: vector store: %w", err)
++	}
++
++	se := &SemanticEngine{
++		db:     db,
++		store:  store,
++		client: client,
++		estore: estore,
++		cfg:    cfg,
++		queue:  make(chan int64, semanticQueueSize),
++	}
++
++	ix, err := estore.LoadIndex(ctx)
++	if err != nil {
++		return nil, fmt.Errorf("semantic: load index: %w", err)
++	}
++	se.index = ix
++	logger.InfoCF("seahorse", "semantic index loaded", map[string]any{
++		"vectors": ix.Len(),
++		"model":   cfg.EmbeddingModel,
++		"dim":     cfg.EmbeddingDim,
++	})
++
++	// Async write path is the default; it is the only mode that matters for
++	// live ingest. AsyncWrite=false falls back to synchronous embedding in
++	// Ingest (still non-fatal on error).
++	if cfg.AsyncWriteEnabled() {
++		se.startWorker()
++	}
++	return se, nil
++}
++
++// normalizeEmbeddingEndpoint accepts either the base URL (http://host:18084/v1)
++// or the full endpoint (http://host:18084/v1/embeddings) and returns the base.
++func normalizeEmbeddingEndpoint(endpoint string) string {
++	e := strings.TrimRight(strings.TrimSpace(endpoint), "/")
++	if strings.HasSuffix(e, "/embeddings") {
++		e = strings.TrimRight(strings.TrimSuffix(e, "/embeddings"), "/")
++	}
++	return e
++}
++
++// startWorker launches the async embedding consumer.
++func (e *SemanticEngine) startWorker() {
++	e.wg.Add(1)
++	go func() {
++		defer e.wg.Done()
++		for id := range e.queue {
++			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
++			err := e.embedOne(ctx, id)
++			cancel()
++			if err != nil {
++				logger.WarnCF("seahorse", "async embed failed", map[string]any{
++					"message_id": id,
++					"error":      err.Error(),
++				})
++			}
++		}
++	}()
++}
++
++// Enqueue adds message IDs to the async embedding queue. Non-blocking; drops
++// when the queue is full (memory degrades to grep-only, never breaks).
++func (e *SemanticEngine) Enqueue(ids ...int64) {
++	e.lifecycleMu.Lock()
++	defer e.lifecycleMu.Unlock()
++	if e.closed {
++		return
++	}
++	for _, id := range ids {
++		select {
++		case e.queue <- id:
++		default:
++			logger.WarnCF("seahorse", "embed queue full; dropping", map[string]any{"message_id": id})
++		}
++	}
++}
++
++// embedOne embeds a single message and updates the index.
++func (e *SemanticEngine) embedOne(ctx context.Context, messageID int64) error {
++	msg, err := e.store.GetMessageByID(ctx, messageID)
++	if err != nil {
++		return err
++	}
++	text := messageEmbedText(msg)
++	vec, err := e.client.Embed(ctx, text)
++	if err != nil {
++		return err
++	}
++	if err := e.estore.Upsert(ctx, messageID, vec); err != nil {
++		return err
++	}
++	e.addToIndex(messageID, vec)
++	return nil
++}
++
++// Backfill embeds all messages that lack a vector for the configured model.
++// Returns the number embedded; stops early on error or context cancellation
++// (callers resume on next startup — PendingIDs only returns un-embedded rows).
++func (e *SemanticEngine) Backfill(ctx context.Context, batchSize int) (int, error) {
++	if batchSize <= 0 {
++		batchSize = 16
++	}
++	total := 0
++	for {
++		pending, err := e.estore.PendingIDs(ctx, 0, batchSize)
++		if err != nil {
++			return total, err
++		}
++		if len(pending) == 0 {
++			return total, nil
++		}
++
++		texts := make([]string, 0, len(pending))
++		msgByID := make(map[int64]*Message, len(pending))
++		for _, id := range pending {
++			msg, err := e.store.GetMessageByID(ctx, id)
++			if err != nil {
++				texts = append(texts, "[missing message]")
++				continue
++			}
++			msgByID[id] = msg
++			texts = append(texts, messageEmbedText(msg))
++		}
++
++		vecs, err := e.client.EmbedBatch(ctx, texts)
++		if err != nil {
++			return total, err
++		}
++		for i, id := range pending {
++			if i >= len(vecs) {
++				break
++			}
++			if msgByID[id] == nil {
++				continue // message vanished mid-backfill
++			}
++			if err := e.estore.Upsert(ctx, id, vecs[i]); err != nil {
++				logger.WarnCF("seahorse", "backfill upsert failed", map[string]any{"message_id": id, "error": err.Error()})
++				continue
++			}
++			e.addToIndex(id, vecs[i])
++		}
++		total += len(pending)
++		logger.InfoCF("seahorse", "semantic backfill progress", map[string]any{"embedded": total})
++
++		// Pause briefly so live ingest traffic isn't starved.
++		select {
++		case <-ctx.Done():
++			return total, ctx.Err()
++		case <-time.After(200 * time.Millisecond):
++		}
++	}
++}
++
++// addToIndex inserts or replaces a vector under the index lock.
++func (e *SemanticEngine) addToIndex(messageID int64, vec []float32) {
++	e.indexMu.Lock()
++	defer e.indexMu.Unlock()
++	e.index.Add(messageID, vec)
++}
++
++// search returns nearest neighbors for a query vector.
++func (e *SemanticEngine) search(vec []float32, topK int, minScore float64) []embeddings.Hit {
++	e.indexMu.RLock()
++	defer e.indexMu.RUnlock()
++	return e.index.Search(vec, topK, minScore)
++}
++
++// Close stops the async worker and drains the queue.
++func (e *SemanticEngine) Close() {
++	e.lifecycleMu.Lock()
++	if e.closed {
++		e.lifecycleMu.Unlock()
++		return
++	}
++	e.closed = true
++	close(e.queue)
++	e.lifecycleMu.Unlock()
++	e.wg.Wait()
++}
++
++// messageEmbedText builds a compact text representation of a message for
++// embedding. Prefers top-level content and appends parts (tool names,
++// arguments, results, media URIs) so tool-heavy turns stay searchable.
++func messageEmbedText(msg *Message) string {
++	var b strings.Builder
++	b.WriteString(msg.Content)
++	for _, p := range msg.Parts {
++		switch p.Type {
++		case "tool_use":
++			b.WriteString(" [tool: ")
++			b.WriteString(p.Name)
++			if p.Arguments != "" {
++				b.WriteString(" ")
++				b.WriteString(p.Arguments)
++			}
++			b.WriteString("]")
++		case "tool_result":
++			if p.Text != "" {
++				b.WriteString(" [result: ")
++				b.WriteString(p.Text)
++				b.WriteString("]")
++			}
++		case "media":
++			if p.MediaURI != "" {
++				b.WriteString(" [media: ")
++				b.WriteString(p.MediaURI)
++				b.WriteString("]")
++			}
++		}
++	}
++	s := strings.TrimSpace(b.String())
++	if s == "" {
++		return "[empty message]"
++	}
++	if len(s) > maxEmbedTextLen {
++		s = s[:maxEmbedTextLen]
++	}
++	return s
++}
++
++// semanticSnippet renders a compact one-line snippet for search results.
++func semanticSnippet(content string) string {
++	s := strings.Join(strings.Fields(content), " ")
++	if len(s) > 200 {
++		s = s[:200] + "…"
++	}
++	return s
++}
+diff --git a/pkg/seahorse/semantic_test.go b/pkg/seahorse/semantic_test.go
+new file mode 100644
+index 00000000..5e035bc0
+--- /dev/null
++++ b/pkg/seahorse/semantic_test.go
+@@ -0,0 +1,474 @@
++package seahorse
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/sipeed/picoclaw/pkg/tools"
++)
++
++// fakeEmbedServer returns deterministic vectors so tests can verify that
++// semantically similar texts land near each other. Each distinct word maps to
++// a unique basis vector; the final vector is the sum of the words' vectors.
++func fakeEmbedServer(t *testing.T) *httptest.Server {
++	t.Helper()
++
++	wordVec := func(word string) []float32 {
++		switch strings.ToLower(word) {
++		case "gpu", "gpus", "a770", "wedge", "reset", "resets":
++			return []float32{1, 0, 0, 0}
++		case "audio", "sound", "crackle", "crackling", "rtkit":
++			return []float32{0, 1, 0, 0}
++		case "backup", "restore", "restic", "gdrive":
++			return []float32{0, 0, 1, 0}
++		case "pihole", "pi-hole", "dns", "blocklist":
++			return []float32{0, 0, 0, 1}
++		default:
++			return []float32{0, 0, 0, 0}
++		}
++	}
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !strings.HasSuffix(r.URL.Path, "/embeddings") {
++			http.Error(w, "not found", http.StatusNotFound)
++			return
++		}
++		var req struct {
++			Input []string `json:"input"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		type item struct {
++			Object    string    `json:"object"`
++			Index     int       `json:"index"`
++			Embedding []float32 `json:"embedding"`
++		}
++		data := make([]item, 0, len(req.Input))
++		for i, text := range req.Input {
++			vec := []float32{0, 0, 0, 0}
++			for _, w := range strings.Fields(text) {
++				wv := wordVec(strings.Trim(w, ".,!?[]():"))
++				for j := range vec {
++					vec[j] += wv[j]
++				}
++			}
++			data = append(data, item{Object: "embedding", Index: i, Embedding: vec})
++		}
++		_ = json.NewEncoder(w).Encode(map[string]any{
++			"data":  data,
++			"model": "fake-embed",
++			"usage": map[string]any{"prompt_tokens": 1, "total_tokens": 1},
++		})
++	}))
++	t.Cleanup(server.Close)
++	return server
++}
++
++func semanticTestConfig(t *testing.T, endpoint string) Config {
++	t.Helper()
++	return Config{
++		DBPath:            filepath.Join(t.TempDir(), "semantic.db"),
++		EnableSemantic:    true,
++		EmbeddingEndpoint: endpoint + "/v1/embeddings",
++		EmbeddingModel:    "fake-embed",
++		EmbeddingDim:      4,
++		TopK:              5,
++		MinScore:          0.1,
++	}
++}
++
++func TestValidateSemantic(t *testing.T) {
++	good := semanticTestConfig(t, "http://x")
++	if err := good.ValidateSemantic(); err != nil {
++		t.Errorf("good config should validate: %v", err)
++	}
++	if err := (Config{EnableSemantic: true}).ValidateSemantic(); err == nil {
++		t.Error("missing endpoint should error")
++	}
++	if err := (Config{EnableSemantic: true, EmbeddingEndpoint: "http://x"}).ValidateSemantic(); err == nil {
++		t.Error("missing model should error")
++	}
++	if err := (Config{EnableSemantic: true, EmbeddingEndpoint: "http://x", EmbeddingModel: "m"}).ValidateSemantic(); err == nil {
++		t.Error("missing dim should error")
++	}
++	if err := (Config{EnableSemantic: false}).ValidateSemantic(); err != nil {
++		t.Errorf("disabled config should always validate: %v", err)
++	}
++}
++
++func TestSemanticDisabledByDefault(t *testing.T) {
++	dir := t.TempDir()
++	eng, err := NewEngine(Config{DBPath: filepath.Join(dir, "short.db")}, nil)
++	if err != nil {
++		t.Fatalf("NewEngine: %v", err)
++	}
++	defer eng.Close()
++
++	if eng.SemanticEnabled() {
++		t.Error("semantic should be disabled by default")
++	}
++	_, err = eng.GetRetrieval().Semantic(context.Background(), SemanticInput{Query: "anything"})
++	if err == nil {
++		t.Error("Semantic should error when disabled")
++	}
++}
++
++func TestSemanticInvalidConfig(t *testing.T) {
++	dir := t.TempDir()
++	_, err := NewEngine(Config{
++		DBPath:            filepath.Join(dir, "short.db"),
++		EnableSemantic:    true,
++		EmbeddingEndpoint: "", // missing
++	}, nil)
++	if err == nil {
++		t.Fatal("expected error for incomplete semantic config")
++	}
++}
++
++// waitForEmbedCount polls until the vector store has the expected rows.
++func waitForEmbedCount(t *testing.T, eng *Engine, want int) {
++	t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		n, err := eng.semantic.estore.CountForModel(context.Background())
++		if err == nil && n >= want {
++			return
++		}
++		time.Sleep(25 * time.Millisecond)
++	}
++	got, _ := eng.semantic.estore.CountForModel(context.Background())
++	t.Fatalf("timed out waiting for %d embeddings, got %d", want, got)
++}
++
++func TestSemanticIngestAndSearch(t *testing.T) {
++	server := fakeEmbedServer(t)
++	eng, err := NewEngine(semanticTestConfig(t, server.URL), nil)
++	if err != nil {
++		t.Fatalf("NewEngine: %v", err)
++	}
++	defer eng.Close()
++	if !eng.SemanticEnabled() {
++		t.Fatal("expected semantic enabled")
++	}
++
++	ctx := context.Background()
++	_, err = eng.Ingest(ctx, "agent:sem-test", []Message{
++		{Role: "user", Content: "the gpu wedges and resets under compute load", TokenCount: 8},
++		{Role: "user", Content: "fix the audio crackle by installing rtkit", TokenCount: 8},
++	})
++	if err != nil {
++		t.Fatalf("Ingest: %v", err)
++	}
++	waitForEmbedCount(t, eng, 2)
++
++	res, err := eng.GetRetrieval().Semantic(ctx, SemanticInput{Query: "gpu reset problems"})
++	if err != nil {
++		t.Fatalf("Semantic: %v", err)
++	}
++	if len(res.Messages) == 0 {
++		t.Fatalf("expected semantic hits, got none (hint: %s)", res.Hint)
++	}
++	if !strings.Contains(res.Messages[0].Snippet, "gpu") {
++		t.Errorf("top hit should be the gpu message, got %q (rank %.2f)", res.Messages[0].Snippet, res.Messages[0].Rank)
++	}
++	if res.Messages[0].Rank <= 0 {
++		t.Errorf("expected positive cosine rank, got %f", res.Messages[0].Rank)
++	}
++
++	// Query for the audio message should rank it top.
++	res2, err := eng.GetRetrieval().Semantic(ctx, SemanticInput{Query: "sound crackling audio issue"})
++	if err != nil {
++		t.Fatalf("Semantic 2: %v", err)
++	}
++	if len(res2.Messages) == 0 {
++		t.Fatalf("expected hits for audio query")
++	}
++	if !strings.Contains(res2.Messages[0].Snippet, "audio") {
++		t.Errorf("top hit should be the audio message, got %q (rank %.2f)", res2.Messages[0].Snippet, res2.Messages[0].Rank)
++	}
++}
++
++func TestSemanticToolAndExpand(t *testing.T) {
++	server := fakeEmbedServer(t)
++	eng, err := NewEngine(semanticTestConfig(t, server.URL), nil)
++	if err != nil {
++		t.Fatalf("NewEngine: %v", err)
++	}
++	defer eng.Close()
++
++	ctx := context.Background()
++	_, err = eng.Ingest(ctx, "agent:sem-tool", []Message{
++		{Role: "user", Content: "remember to back up with restic every week", TokenCount: 8},
++		{Role: "user", Content: "pihole dns blocklists are on swarm1 and swarm2", TokenCount: 8},
++	})
++	if err != nil {
++		t.Fatalf("Ingest: %v", err)
++	}
++	waitForEmbedCount(t, eng, 2)
++
++	tool := NewSemanticTool(eng.GetRetrieval())
++	if tool.Name() != "short_semantic" {
++		t.Errorf("Name = %q, want short_semantic", tool.Name())
++	}
++
++	// Missing query -> error result
++	bad := tool.Execute(ctx, map[string]any{})
++	if bad == nil || bad.IsError == false {
++		t.Error("missing query should return error result")
++	}
++
++	// Happy path
++	res := tool.Execute(ctx, map[string]any{"query": "restic restore backup"})
++	if res == nil || res.IsError {
++		t.Fatalf("execute failed: %v", res)
++	}
++	if !strings.Contains(res.ForLLM, "restic") {
++		t.Errorf("expected backup message in results, got: %s", res.ForLLM)
++	}
++	var out struct {
++		Messages []GrepMessageResult `json:"messages"`
++	}
++	if err := json.Unmarshal([]byte(res.ForLLM), &out); err != nil {
++		t.Fatalf("unmarshal result: %v", err)
++	}
++	if len(out.Messages) == 0 {
++		t.Fatal("expected messages in tool output")
++	}
++
++	// Expand the top hit -> full message text
++	expanded, err := eng.GetRetrieval().ExpandMessages(ctx, []int64{out.Messages[0].ID})
++	if err != nil {
++		t.Fatalf("ExpandMessages: %v", err)
++	}
++	if len(expanded.Messages) == 0 || !strings.Contains(expanded.Messages[0].Content, "restic") {
++		t.Errorf("expanded message should contain restic, got %+v", expanded.Messages)
++	}
++}
++
++func TestSemanticBackfill(t *testing.T) {
++	server := fakeEmbedServer(t)
++	eng, err := NewEngine(semanticTestConfig(t, server.URL), nil)
++	if err != nil {
++		t.Fatalf("NewEngine: %v", err)
++	}
++	defer eng.Close()
++
++	ctx := context.Background()
++	conv, err := eng.store.GetOrCreateConversation(ctx, "agent:sem-backfill")
++	if err != nil {
++		t.Fatalf("GetOrCreateConversation: %v", err)
++	}
++	// Add messages directly to the store so they bypass the ingest queue.
++	var ids []int64
++	for _, content := range []string{"backup the whole fleet nightly", "dns pihole blocking ads", "gpu wedge reset storm"} {
++		m, err := eng.store.AddMessage(ctx, conv.ConversationID, "user", content, 5)
++		if err != nil {
++			t.Fatalf("AddMessage: %v", err)
++		}
++		ids = append(ids, m.ID)
++	}
++
++	before, err := eng.semantic.estore.CountForModel(ctx)
++	if err != nil {
++		t.Fatalf("CountForModel before: %v", err)
++	}
++	if before != 0 {
++		t.Fatalf("expected 0 embeddings before backfill, got %d", before)
++	}
++
++	n, err := eng.SemanticBackfill(ctx, 2)
++	if err != nil {
++		t.Fatalf("SemanticBackfill: %v", err)
++	}
++	if n != 3 {
++		t.Errorf("backfill embedded %d, want 3", n)
++	}
++
++	after, _ := eng.semantic.estore.CountForModel(ctx)
++	if after != 3 {
++		t.Errorf("after backfill count = %d, want 3", after)
++	}
++
++	// Second run should be a no-op (all embedded).
++	n2, err := eng.SemanticBackfill(ctx, 2)
++	if err != nil {
++		t.Fatalf("SemanticBackfill 2: %v", err)
++	}
++	if n2 != 0 {
++		t.Errorf("second backfill embedded %d, want 0", n2)
++	}
++
++	// Semantic search should now find the backup message.
++	res, err := eng.GetRetrieval().Semantic(ctx, SemanticInput{Query: "restic restore backup"})
++	if err != nil {
++		t.Fatalf("Semantic after backfill: %v", err)
++	}
++	if len(res.Messages) == 0 || !strings.Contains(res.Messages[0].Snippet, "backup") {
++		t.Errorf("expected backup message top, got %+v", res.Messages)
++	}
++}
++
++func TestMessageEmbedText(t *testing.T) {
++	msg := &Message{
++		Content: "do the thing",
++		Parts: []MessagePart{
++			{Type: "tool_use", Name: "exec", Arguments: `{"command":"df -h"}`},
++			{Type: "tool_result", ToolCallID: "call_1", Text: "disk is full"},
++			{Type: "media", MediaURI: "/tmp/photo.png"},
++		},
++	}
++	text := messageEmbedText(msg)
++	for _, want := range []string{"do the thing", "tool: exec", "df -h", "result: disk is full", "media: /tmp/photo.png"} {
++		if !strings.Contains(text, want) {
++			t.Errorf("embed text missing %q: %s", want, text)
++		}
++	}
++
++	if got := messageEmbedText(&Message{}); got != "[empty message]" {
++		t.Errorf("empty message text = %q, want [empty message]", got)
++	}
++
++	long := &Message{Content: strings.Repeat("x", maxEmbedTextLen+100)}
++	if len(messageEmbedText(long)) > maxEmbedTextLen {
++		t.Error("embed text should be capped at maxEmbedTextLen")
++	}
++}
++
++func TestSemanticConversationScoping(t *testing.T) {
++	server := fakeEmbedServer(t)
++	eng, err := NewEngine(semanticTestConfig(t, server.URL), nil)
++	if err != nil {
++		t.Fatalf("NewEngine: %v", err)
++	}
++	defer eng.Close()
++
++	ctx := context.Background()
++	for _, sk := range []string{"agent:scope-a", "agent:scope-b"} {
++		_, err := eng.Ingest(ctx, sk, []Message{{Role: "user", Content: "the gpu wedges on the a770", TokenCount: 6}})
++		if err != nil {
++			t.Fatalf("Ingest %s: %v", sk, err)
++		}
++	}
++	waitForEmbedCount(t, eng, 2)
++
++	convA, err := eng.store.GetConversationBySessionKey(ctx, "agent:scope-a")
++	if err != nil || convA == nil {
++		t.Fatalf("get conv A: %v", err)
++	}
++
++	// Scoped to conversation A -> exactly 1 hit.
++	res, err := eng.GetRetrieval().Semantic(ctx, SemanticInput{
++		Query:          "gpu reset",
++		ConversationID: convA.ConversationID,
++	})
++	if err != nil {
++		t.Fatalf("Semantic scoped: %v", err)
++	}
++	if len(res.Messages) != 1 {
++		t.Fatalf("expected 1 scoped hit, got %d", len(res.Messages))
++	}
++	if res.Messages[0].ConversationID != convA.ConversationID {
++		t.Errorf("hit belongs to wrong conversation: %d", res.Messages[0].ConversationID)
++	}
++
++	// All conversations -> 2 hits.
++	resAll, err := eng.GetRetrieval().Semantic(ctx, SemanticInput{Query: "gpu reset", AllConversations: true})
++	if err != nil {
++		t.Fatalf("Semantic all: %v", err)
++	}
++	if len(resAll.Messages) != 2 {
++		t.Fatalf("expected 2 all-conversation hits, got %d", len(resAll.Messages))
++	}
++}
++
++func TestSemanticToolScopesToSessionWhenRequested(t *testing.T) {
++	server := fakeEmbedServer(t)
++	eng, err := NewEngine(semanticTestConfig(t, server.URL), nil)
++	if err != nil {
++		t.Fatalf("NewEngine: %v", err)
++	}
++	defer eng.Close()
++
++	ctx := context.Background()
++	for _, sk := range []string{"agent:tool-scope-a", "agent:tool-scope-b"} {
++		_, err := eng.Ingest(ctx, sk, []Message{{Role: "user", Content: "pihole dns blocklist", TokenCount: 6}})
++		if err != nil {
++			t.Fatalf("Ingest %s: %v", sk, err)
++		}
++	}
++	waitForEmbedCount(t, eng, 2)
++
++	// Simulate a turn in conversation A.
++	convA, _ := eng.store.GetConversationBySessionKey(ctx, "agent:tool-scope-a")
++	ctxWithSession := tools.WithToolSessionContext(ctx, "default", "agent:tool-scope-a", nil)
++
++	tool := NewSemanticTool(eng.GetRetrieval())
++	res := tool.Execute(ctxWithSession, map[string]any{"query": "dns", "all_conversations": false})
++	if res == nil || res.IsError {
++		t.Fatalf("execute failed: %v", res)
++	}
++	var out struct {
++		Messages []GrepMessageResult `json:"messages"`
++	}
++	if err := json.Unmarshal([]byte(res.ForLLM), &out); err != nil {
++		t.Fatalf("unmarshal: %v", err)
++	}
++	if len(out.Messages) != 1 {
++		t.Fatalf("expected 1 hit scoped to current session, got %d", len(out.Messages))
++	}
++	if out.Messages[0].ConversationID != convA.ConversationID {
++		t.Errorf("hit conversation %d, want %d", out.Messages[0].ConversationID, convA.ConversationID)
++	}
++
++	// Default (all_conversations true) -> both.
++	resAll := tool.Execute(ctxWithSession, map[string]any{"query": "dns"})
++	if resAll == nil || resAll.IsError {
++		t.Fatalf("execute all failed: %v", resAll)
++	}
++	var outAll struct {
++		Messages []GrepMessageResult `json:"messages"`
++	}
++	if err := json.Unmarshal([]byte(resAll.ForLLM), &outAll); err != nil {
++		t.Fatalf("unmarshal all: %v", err)
++	}
++	if len(outAll.Messages) != 2 {
++		t.Fatalf("expected 2 all-conversation hits, got %d", len(outAll.Messages))
++	}
++}
++
++func TestSemanticNormalizeEndpoint(t *testing.T) {
++	cases := []struct{ in, want string }{
++		{"http://100.88.1.92:18084/v1/embeddings", "http://100.88.1.92:18084/v1"},
++		{"http://100.88.1.92:18084/v1/embeddings/", "http://100.88.1.92:18084/v1"},
++		{"http://100.88.1.92:18084/v1", "http://100.88.1.92:18084/v1"},
++		{"  http://x:18084/v1/embeddings  ", "http://x:18084/v1"},
++		{"", ""},
++	}
++	for _, c := range cases {
++		if got := normalizeEmbeddingEndpoint(c.in); got != c.want {
++			t.Errorf("normalizeEmbeddingEndpoint(%q) = %q, want %q", c.in, got, c.want)
++		}
++	}
++}
++
++func TestSQLiteDSN(t *testing.T) {
++	cases := []struct{ in, want string }{
++		{"/tmp/x.db", "/tmp/x.db?_pragma=foreign_keys(1)"},
++		{"file:/tmp/x.db?mode=rwc", "file:/tmp/x.db?mode=rwc&_pragma=foreign_keys(1)"},
++		{":memory:", ":memory:"},
++		{"/tmp/x.db?_pragma=foreign_keys(1)", "/tmp/x.db?_pragma=foreign_keys(1)"},
++	}
++	for _, c := range cases {
++		if got := sqliteDSN(c.in); got != c.want {
++			t.Errorf("sqliteDSN(%q) = %q, want %q", c.in, got, c.want)
++		}
++	}
++}
+diff --git a/pkg/seahorse/short_engine.go b/pkg/seahorse/short_engine.go
+index ddada0e9..d3163e55 100644
+--- a/pkg/seahorse/short_engine.go
++++ b/pkg/seahorse/short_engine.go
+@@ -3,6 +3,7 @@ package seahorse
+ import (
+ 	"context"
+ 	"database/sql"
++	"errors"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+@@ -21,6 +22,39 @@ type Config struct {
+ 	DBPath                   string   `json:"dbPath"`
+ 	IgnoreSessionPatterns    []string `json:"ignoreSessionPatterns,omitempty"`
+ 	StatelessSessionPatterns []string `json:"statelessSessionPatterns,omitempty"`
++
++	// Semantic memory (Tier 3, M2). When EnableSemantic is false (the
++	// default), no embedding code runs and behavior is identical to pre-M2.
++	EnableSemantic             bool     `json:"enableSemantic,omitempty"`             // master switch
++	EmbeddingEndpoint          string   `json:"embeddingEndpoint,omitempty"`          // e.g. http://100.88.1.92:18084/v1/embeddings
++	EmbeddingModel             string   `json:"embeddingModel,omitempty"`             // e.g. jina-embeddings-v3
++	EmbeddingDim               int      `json:"embeddingDim,omitempty"`               // e.g. 1024
++	TopK                       int      `json:"topK,omitempty"`                       // default 8
++	MinScore                   float64  `json:"minScore,omitempty"`                   // default 0.35
++	AsyncWrite                 *bool    `json:"asyncWrite,omitempty"`                 // default true (nil = true)
++	IgnoreSessionsForEmbedding []string `json:"ignoreSessionsForEmbedding,omitempty"` // session globs to skip embedding
++}
++
++// AsyncWriteEnabled reports whether async embedding is enabled (default true).
++func (c Config) AsyncWriteEnabled() bool {
++	return c.AsyncWrite == nil || *c.AsyncWrite
++}
++
++// ValidateSemantic verifies the semantic-memory configuration is complete.
++func (c Config) ValidateSemantic() error {
++	if !c.EnableSemantic {
++		return nil
++	}
++	if normalizeEmbeddingEndpoint(c.EmbeddingEndpoint) == "" {
++		return errors.New("enableSemantic requires embeddingEndpoint (e.g. http://100.88.1.92:18084/v1/embeddings)")
++	}
++	if c.EmbeddingModel == "" {
++		return errors.New("enableSemantic requires embeddingModel")
++	}
++	if c.EmbeddingDim <= 0 {
++		return errors.New("enableSemantic requires embeddingDim > 0")
++	}
++	return nil
+ }
+ 
+ // CompleteFn is the LLM completion function type.
+@@ -61,10 +95,12 @@ type Engine struct {
+ 	assembler         *Assembler
+ 	assemblerMu       sync.Mutex
+ 	retrieval         *RetrievalEngine
++	semantic          *SemanticEngine
+ 	config            Config
+ 	complete          CompleteFn
+ 	ignorePatterns    []*regexp.Regexp
+ 	statelessPatterns []*regexp.Regexp
++	embedSkipPatterns []*regexp.Regexp
+ 	sessionShards     [numSessionShards]struct {
+ 		mu sync.Mutex
+ 	}
+@@ -88,8 +124,9 @@ type Assembler struct {
+ 
+ // RetrievalEngine handles search and expansion (defined in short_retrieval.go).
+ type RetrievalEngine struct {
+-	store  *Store
+-	config Config
++	store    *Store
++	config   Config
++	semantic *SemanticEngine // nil when semantic memory is disabled
+ }
+ 
+ // Store returns the underlying store for direct access.
+@@ -106,7 +143,7 @@ func NewEngine(config Config, completeFn CompleteFn) (*Engine, error) {
+ 		}
+ 	}
+ 
+-	db, err := sql.Open("sqlite", config.DBPath)
++	db, err := sql.Open("sqlite", sqliteDSN(config.DBPath))
+ 	if err != nil {
+ 		return nil, fmt.Errorf("open db: %w", err)
+ 	}
+@@ -132,25 +169,55 @@ func NewEngine(config Config, completeFn CompleteFn) (*Engine, error) {
+ 
+ 	store := &Store{db: db}
+ 
++	// Semantic memory: optional, off by default.
++	var semantic *SemanticEngine
++	if config.EnableSemantic {
++		if err := config.ValidateSemantic(); err != nil {
++			_ = db.Close()
++			return nil, err
++		}
++		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++		semantic, err = newSemanticEngine(ctx, db, store, config)
++		cancel()
++		if err != nil {
++			_ = db.Close()
++			return nil, fmt.Errorf("semantic engine: %w", err)
++		}
++	}
++
+ 	// Prepend hardcoded ignore patterns (spec lines 1326-1328)
+ 	ignorePatterns := make([]string, 0, 1+len(config.IgnoreSessionPatterns))
+ 	ignorePatterns = append(ignorePatterns, "heartbeat")
+ 	ignorePatterns = append(ignorePatterns, config.IgnoreSessionPatterns...)
+ 
+-	retrieval := &RetrievalEngine{store: store, config: config}
++	retrieval := &RetrievalEngine{store: store, config: config, semantic: semantic}
+ 
+ 	return &Engine{
+ 		store:             store,
+ 		compaction:        nil,
+ 		assembler:         nil,
+ 		retrieval:         retrieval,
++		semantic:          semantic,
+ 		config:            config,
+ 		complete:          completeFn,
+ 		ignorePatterns:    compileSessionPatterns(ignorePatterns),
+ 		statelessPatterns: compileSessionPatterns(config.StatelessSessionPatterns),
++		embedSkipPatterns: compileSessionPatterns(config.IgnoreSessionsForEmbedding),
+ 	}, nil
+ }
+ 
++// sqliteDSN returns a DSN for config.DBPath with foreign keys enabled so the
++// message_embeddings table cascades deletes with its parent messages row.
++func sqliteDSN(path string) string {
++	if path == ":memory:" || strings.Contains(path, "_pragma=") {
++		return path
++	}
++	if strings.Contains(path, "?") {
++		return path + "&_pragma=foreign_keys(1)"
++	}
++	return path + "?_pragma=foreign_keys(1)"
++}
++
+ // compileSessionPattern converts a glob pattern to a compiled regex.
+ // Pattern rules:
+ //   - *  matches any sequence of non-colon characters ([^:]*)
+@@ -213,6 +280,17 @@ func (e *Engine) isStatelessSession(sessionKey string) bool {
+ 	return false
+ }
+ 
++// shouldSkipEmbedding returns true if the session key matches any
++// ignoreSessionsForEmbedding pattern.
++func (e *Engine) shouldSkipEmbedding(sessionKey string) bool {
++	for _, p := range e.embedSkipPatterns {
++		if p.MatchString(sessionKey) {
++			return true
++		}
++	}
++	return false
++}
++
+ // fnv32 computes FNV-1a 32-bit hash for session key sharding.
+ func fnv32(key string) uint32 {
+ 	h := uint32(2166136261)
+@@ -288,6 +366,11 @@ func (e *Engine) Ingest(ctx context.Context, sessionKey string, messages []Messa
+ 		return nil, fmt.Errorf("append context: %w", err)
+ 	}
+ 
++	// Enqueue async embeddings for semantic memory (no-op when disabled).
++	if e.semantic != nil && !e.shouldSkipEmbedding(sessionKey) {
++		e.semantic.Enqueue(msgIDs...)
++	}
++
+ 	logger.InfoCF("seahorse", "ingest", map[string]any{
+ 		"conv_id":  conv.ConversationID,
+ 		"messages": len(messages),
+@@ -305,12 +388,29 @@ func (e *Engine) Close() error {
+ 	if e.compaction != nil {
+ 		e.compaction.Close()
+ 	}
++	if e.semantic != nil {
++		e.semantic.Close()
++	}
+ 	if e.store != nil && e.store.db != nil {
+ 		return e.store.db.Close()
+ 	}
+ 	return nil
+ }
+ 
++// SemanticEnabled reports whether the semantic memory engine is active.
++func (e *Engine) SemanticEnabled() bool {
++	return e.semantic != nil
++}
++
++// SemanticBackfill embeds all messages missing vectors for the configured
++// model. No-op when semantic memory is disabled. Returns the count embedded.
++func (e *Engine) SemanticBackfill(ctx context.Context, batchSize int) (int, error) {
++	if e.semantic == nil {
++		return 0, nil
++	}
++	return e.semantic.Backfill(ctx, batchSize)
++}
++
+ // GetRetrieval returns the retrieval engine for tool implementations.
+ func (e *Engine) GetRetrieval() *RetrievalEngine {
+ 	return e.retrieval
+diff --git a/pkg/seahorse/short_retrieval.go b/pkg/seahorse/short_retrieval.go
+index c9f1dd70..81bbff7c 100644
+--- a/pkg/seahorse/short_retrieval.go
++++ b/pkg/seahorse/short_retrieval.go
+@@ -2,6 +2,7 @@ package seahorse
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"regexp"
+ 	"strconv"
+@@ -213,3 +214,75 @@ func (r *RetrievalEngine) ExpandMessages(ctx context.Context, messageIDs []int64
+ 
+ 	return result, nil
+ }
++
++// SemanticInput controls embedding-based (meaning) search.
++type SemanticInput struct {
++	Query            string  `json:"query"`
++	Limit            int     `json:"limit,omitempty"`            // default config.TopK (8)
++	MinScore         float64 `json:"minScore,omitempty"`         // default config.MinScore (0.35)
++	AllConversations bool    `json:"allConversations,omitempty"` // default true for semantic memory
++	ConversationID   int64   `json:"conversationId,omitempty"`   // scoped when !AllConversations
++}
++
++// Semantic searches message embeddings by meaning (cosine similarity) and
++// returns hits shaped like GrepResult so callers/tools can present them the
++// same way. Rank is the cosine score (higher = more similar), unlike the
++// negative bm25 rank used by Grep.
++func (r *RetrievalEngine) Semantic(ctx context.Context, input SemanticInput) (*GrepResult, error) {
++	if r.semantic == nil {
++		return nil, errors.New("semantic memory is disabled (set context_manager_config.enableSemantic: true)")
++	}
++	if strings.TrimSpace(input.Query) == "" {
++		return nil, errors.New("semantic: query is required")
++	}
++
++	limit := input.Limit
++	if limit <= 0 {
++		limit = r.config.TopK
++	}
++	if limit <= 0 {
++		limit = defaultSemanticTopK
++	}
++	minScore := input.MinScore
++	if minScore == 0 {
++		minScore = r.config.MinScore
++	}
++	if minScore == 0 {
++		minScore = defaultSemanticMinScore
++	}
++
++	vec, err := r.semantic.client.Embed(ctx, input.Query)
++	if err != nil {
++		return nil, fmt.Errorf("semantic: embed query: %w", err)
++	}
++
++	hits := r.semantic.search(vec, limit, minScore)
++
++	result := &GrepResult{
++		Success:   true,
++		Summaries: make([]GrepSummaryResult, 0),
++		Messages:  make([]GrepMessageResult, 0),
++	}
++	for _, h := range hits {
++		msg, err := r.store.GetMessageByID(ctx, h.MessageID)
++		if err != nil {
++			continue
++		}
++		if input.ConversationID > 0 && !input.AllConversations && msg.ConversationID != input.ConversationID {
++			continue
++		}
++		result.Messages = append(result.Messages, GrepMessageResult{
++			ID:             msg.ID,
++			Snippet:        semanticSnippet(msg.Content),
++			Role:           msg.Role,
++			ConversationID: msg.ConversationID,
++			Rank:           h.Score,
++		})
++		result.TotalMessages = len(result.Messages)
++	}
++
++	if len(result.Messages) == 0 {
++		result.Hint = "No semantic matches above the score threshold. Try lowering min_score, or use short_grep for exact keywords."
++	}
++	return result, nil
++}
+diff --git a/pkg/seahorse/tool_semantic.go b/pkg/seahorse/tool_semantic.go
+new file mode 100644
+index 00000000..9476523d
+--- /dev/null
++++ b/pkg/seahorse/tool_semantic.go
+@@ -0,0 +1,133 @@
++package seahorse
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"strings"
++
++	"github.com/sipeed/picoclaw/pkg/tools"
++)
++
++// SemanticTool searches stored conversation history by meaning using
++// embedding-based retrieval (complements short_grep's keyword search).
++type SemanticTool struct {
++	engine *RetrievalEngine
++}
++
++func NewSemanticTool(engine *RetrievalEngine) *SemanticTool {
++	return &SemanticTool{engine: engine}
++}
++
++func (t *SemanticTool) Name() string {
++	return "short_semantic"
++}
++
++func (t *SemanticTool) Description() string {
++	return `Search stored conversation history by MEANING (semantic/embedding retrieval).
++
++Use this when short_grep (keyword search) can't find something because the
++wording differs — e.g. "how do I fix the audio crackle" will find past
++conversations about "rtkit missing causes constant crackling" even without
++shared keywords.
++
++Searches across ALL conversations by default (it is a memory-recall tool).
++Set all_conversations: false to restrict to the current chat.
++
++Parameters:
++- query (required): What you are trying to recall, in your own words
++- limit: Max results (default: 8)
++- min_score: Cosine similarity threshold, 0..1 (default: 0.35). Raise for
++  stricter matches, lower for fuzzier recall.
++- all_conversations: Search all conversations (default: true)
++
++Returns:
++{
++  "success": true,
++  "messages": [{"id": "123", "snippet": "...", "role": "user", "conversationId": 1, "rank": 0.72}],
++  "hint": "No semantic matches above the score threshold. Try lowering min_score..."
++}
++
++Rank field: cosine similarity (0..1, higher = more similar). Expand with
++short_expand using the message "id" to read full context.
++
++Examples:
++  {"query": "gpu wedges and resets under compute load"}
++  {"query": "how do we back up the workspace", "min_score": 0.5}
++  {"query": "pi hole admin password", "all_conversations": true, "limit": 5}`
++}
++
++func (t *SemanticTool) Parameters() map[string]any {
++	return map[string]any{
++		"type": "object",
++		"properties": map[string]any{
++			"query": map[string]any{
++				"type":        "string",
++				"description": "What you are trying to recall, in your own words",
++			},
++			"limit": map[string]any{
++				"type":        "integer",
++				"description": "Maximum number of results (default: 8)",
++			},
++			"min_score": map[string]any{
++				"type":        "number",
++				"description": "Cosine similarity threshold 0..1 (default: 0.35). Higher = stricter.",
++			},
++			"all_conversations": map[string]any{
++				"type":        "boolean",
++				"description": "Search all conversations (default: true). Set false to scope to current chat.",
++			},
++		},
++		"required": []string{"query"},
++	}
++}
++
++func (t *SemanticTool) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
++	query, ok := args["query"].(string)
++	if !ok || strings.TrimSpace(query) == "" {
++		return tools.ErrorResult("Missing required 'query' argument. Example: {\"query\": \"how did we fix the audio crackle\"}")
++	}
++
++	input := SemanticInput{
++		Query:            query,
++		AllConversations: true, // semantic memory is a recall tool by default
++	}
++
++	if limit, ok := args["limit"].(float64); ok && limit > 0 {
++		input.Limit = int(limit)
++	}
++	if minScore, ok := args["min_score"].(float64); ok {
++		input.MinScore = minScore
++	}
++	if allConv, ok := args["all_conversations"].(bool); ok {
++		input.AllConversations = allConv
++	}
++
++	// Scope to current conversation when requested (default is all).
++	if !input.AllConversations {
++		if sessionKey := tools.ToolSessionKey(ctx); sessionKey != "" {
++			if conv, err := t.engine.store.GetConversationBySessionKey(ctx, sessionKey); err == nil && conv != nil {
++				input.ConversationID = conv.ConversationID
++			}
++		}
++	}
++
++	result, err := t.engine.Semantic(ctx, input)
++	if err != nil {
++		return tools.ErrorResult("Semantic search failed: " + err.Error())
++	}
++
++	output := map[string]any{
++		"success":  result.Success,
++		"messages": result.Messages,
++	}
++	if result.Hint != "" {
++		output["hint"] = result.Hint
++	}
++
++	data, err := json.Marshal(output)
++	if err != nil {
++		return tools.ErrorResult(fmt.Sprintf("failed to marshal semantic result: %v", err))
++	}
++	return tools.NewToolResult(string(data))
++}
+-- 
+2.53.0
+

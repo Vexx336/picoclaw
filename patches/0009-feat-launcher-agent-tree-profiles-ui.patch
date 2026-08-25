@@ -1,0 +1,1019 @@
+From c6e6c2e8d894b8e461288f8e2af4b7792092f915 Mon Sep 17 00:00:00 2001
+From: root <root@Skynet>
+Date: Mon, 24 Aug 2026 16:06:33 -0400
+Subject: [PATCH] feat(launcher): agent tree profiles UI in Advanced Settings
+
+Adds GET /api/agents/tree, POST /api/agents/apply, PUT/DELETE
+/api/agents/profile endpoints to the launcher backend and an Agent
+Trees & Profiles card to the Advanced Settings page: pick a profile,
+apply it to the live tree, edit defaults/agents/dispatch rules, and
+save back to the profile. Profiles live under agents.profiles with
+agents.active_profile recording the applied tree.
+---
+ web/backend/api/agents.go                     | 219 ++++++
+ web/backend/api/router.go                     |   3 +
+ .../config/advanced-config-page.tsx           | 665 ++++++++++++++++++
+ web/frontend/src/i18n/locales/en.json         |  43 +-
+ 4 files changed, 929 insertions(+), 1 deletion(-)
+ create mode 100644 web/backend/api/agents.go
+
+diff --git a/web/backend/api/agents.go b/web/backend/api/agents.go
+new file mode 100644
+index 00000000..3ba7c052
+--- /dev/null
++++ b/web/backend/api/agents.go
+@@ -0,0 +1,219 @@
++package api
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++
++	"github.com/sipeed/picoclaw/pkg/config"
++	"github.com/sipeed/picoclaw/pkg/logger"
++)
++
++// registerAgentTreeRoutes binds agent-tree / profile management endpoints.
++// These back the launcher Advanced Settings "Agent Trees" editor:
++//
++//	GET    /api/agents/tree      → live tree + named profiles + active_profile
++//	POST   /api/agents/apply     → copy a named profile into the live agents block
++//	PUT    /api/agents/profile   → create/update a named profile
++//	DELETE /api/agents/profile   → remove a named profile
++func (h *Handler) registerAgentTreeRoutes(mux *http.ServeMux) {
++	mux.HandleFunc("GET /api/agents/tree", h.handleGetAgentTree)
++	mux.HandleFunc("POST /api/agents/apply", h.handleApplyAgentProfile)
++	mux.HandleFunc("PUT /api/agents/profile", h.handleUpsertAgentProfile)
++	mux.HandleFunc("DELETE /api/agents/profile", h.handleDeleteAgentProfile)
++}
++
++// agentTreeResponse is the compact agent-tree view returned by the launcher.
++type agentTreeResponse struct {
++	Live          config.AgentsConfig          `json:"live"`
++	Profiles      map[string]config.AgentsConfig `json:"profiles"`
++	ActiveProfile string                        `json:"active_profile"`
++}
++
++// handleGetAgentTree returns the live agents block plus all named profiles.
++func (h *Handler) handleGetAgentTree(w http.ResponseWriter, r *http.Request) {
++	cfg, err := config.LoadConfig(h.configPath)
++	if err != nil {
++		http.Error(w, fmt.Sprintf("Failed to load config: %v", err), http.StatusInternalServerError)
++		return
++	}
++	resp := agentTreeResponse{
++		Live:          cfg.Agents,
++		Profiles:      cfg.Agents.Profiles,
++		ActiveProfile: cfg.Agents.ActiveProfile,
++	}
++	w.Header().Set("Content-Type", "application/json")
++	if err := json.NewEncoder(w).Encode(resp); err != nil {
++		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
++	}
++}
++
++// handleApplyAgentProfile copies the named profile into the live agents block
++// (defaults + list + dispatch) and records it as active_profile.
++//
++//	POST /api/agents/apply {"profile":"flash"}
++func (h *Handler) handleApplyAgentProfile(w http.ResponseWriter, r *http.Request) {
++	var req struct {
++		Profile string `json:"profile"`
++	}
++	if err := decodeJSONBody(w, r, &req); err != nil {
++		return
++	}
++	if req.Profile == "" {
++		http.Error(w, "profile is required", http.StatusBadRequest)
++		return
++	}
++
++	cfg, err := config.LoadConfig(h.configPath)
++	if err != nil {
++		http.Error(w, fmt.Sprintf("Failed to load config: %v", err), http.StatusInternalServerError)
++		return
++	}
++	if !cfg.Agents.ApplyProfile(req.Profile) {
++		http.Error(w, fmt.Sprintf("profile %q not found", req.Profile), http.StatusNotFound)
++		return
++	}
++	if !h.saveAgentConfig(w, cfg) {
++		return
++	}
++	writeAgentTreeOK(w, map[string]any{
++		"status":         "ok",
++		"active_profile": req.Profile,
++	})
++}
++
++// handleUpsertAgentProfile creates or updates a named profile. The payload's
++// tree is a full AgentsConfig (defaults + list + dispatch + description).
++// Nested profiles/active_profile in the payload are ignored. When the profile
++// is currently active, the live agents block is re-applied from it so the
++// running tree stays in sync with the saved profile.
++//
++//	PUT /api/agents/profile {"name":"flash","tree":{...}}
++func (h *Handler) handleUpsertAgentProfile(w http.ResponseWriter, r *http.Request) {
++	var req struct {
++		Name string                `json:"name"`
++		Tree *config.AgentsConfig  `json:"tree"`
++	}
++	if err := decodeJSONBody(w, r, &req); err != nil {
++		return
++	}
++	if req.Name == "" {
++		http.Error(w, "name is required", http.StatusBadRequest)
++		return
++	}
++	if req.Tree == nil {
++		http.Error(w, "tree is required", http.StatusBadRequest)
++		return
++	}
++
++	cfg, err := config.LoadConfig(h.configPath)
++	if err != nil {
++		http.Error(w, fmt.Sprintf("Failed to load config: %v", err), http.StatusInternalServerError)
++		return
++	}
++	if cfg.Agents.Profiles == nil {
++		cfg.Agents.Profiles = make(map[string]config.AgentsConfig)
++	}
++	tree := *req.Tree
++	// Sanitize: profiles can't nest profiles or carry active_profile.
++	tree.Profiles = nil
++	tree.ActiveProfile = ""
++	cfg.Agents.Profiles[req.Name] = tree
++	if cfg.Agents.ActiveProfile == req.Name {
++		cfg.Agents.ApplyProfile(req.Name)
++	}
++	if !h.saveAgentConfig(w, cfg) {
++		return
++	}
++	writeAgentTreeOK(w, map[string]any{
++		"status":         "ok",
++		"active_profile": cfg.Agents.ActiveProfile,
++	})
++}
++
++// handleDeleteAgentProfile removes a named profile. If the removed profile was
++// active, active_profile is cleared (the live agents block is left untouched).
++//
++//	DELETE /api/agents/profile {"name":"flash"}
++func (h *Handler) handleDeleteAgentProfile(w http.ResponseWriter, r *http.Request) {
++	var req struct {
++		Name string `json:"name"`
++	}
++	if err := decodeJSONBody(w, r, &req); err != nil {
++		return
++	}
++	if req.Name == "" {
++		http.Error(w, "name is required", http.StatusBadRequest)
++		return
++	}
++
++	cfg, err := config.LoadConfig(h.configPath)
++	if err != nil {
++		http.Error(w, fmt.Sprintf("Failed to load config: %v", err), http.StatusInternalServerError)
++		return
++	}
++	if _, ok := cfg.Agents.Profiles[req.Name]; !ok {
++		http.Error(w, fmt.Sprintf("profile %q not found", req.Name), http.StatusNotFound)
++		return
++	}
++	delete(cfg.Agents.Profiles, req.Name)
++	if cfg.Agents.ActiveProfile == req.Name {
++		cfg.Agents.ActiveProfile = ""
++	}
++	if !h.saveAgentConfig(w, cfg) {
++		return
++	}
++	writeAgentTreeOK(w, map[string]any{
++		"status":         "ok",
++		"active_profile": cfg.Agents.ActiveProfile,
++	})
++}
++
++// saveAgentConfig runs the same validation/save pipeline as handlePatchConfig
++// for an in-memory Config that was mutated by an agent-tree endpoint. It writes
++// an HTTP error and returns false when validation or persistence fails.
++func (h *Handler) saveAgentConfig(w http.ResponseWriter, cfg *config.Config) bool {
++	if err := cfg.SecurityCopyFrom(h.configPath); err != nil {
++		http.Error(w, fmt.Sprintf("Failed to apply security config: %v", err), http.StatusInternalServerError)
++		return false
++	}
++	if errs := validateConfig(cfg); len(errs) > 0 {
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusBadRequest)
++		json.NewEncoder(w).Encode(map[string]any{
++			"status": "validation_error",
++			"errors": errs,
++		})
++		return false
++	}
++	if err := config.SaveConfig(h.configPath, cfg); err != nil {
++		http.Error(w, fmt.Sprintf("Failed to save config: %v", err), http.StatusInternalServerError)
++		return false
++	}
++	h.applyRuntimeLogLevel()
++	logger.Infof("configuration updated successfully")
++	return true
++}
++
++// decodeJSONBody reads and unmarshals a request body (max 1MB). It writes an
++// HTTP error and returns an error on failure.
++func decodeJSONBody(w http.ResponseWriter, r *http.Request, out any) error {
++	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
++	if err != nil {
++		http.Error(w, "Failed to read request body", http.StatusBadRequest)
++		return err
++	}
++	defer r.Body.Close()
++	if err := json.Unmarshal(body, out); err != nil {
++		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
++		return err
++	}
++	return nil
++}
++
++// writeAgentTreeOK sends a JSON success response.
++func writeAgentTreeOK(w http.ResponseWriter, payload map[string]any) {
++	w.Header().Set("Content-Type", "application/json")
++	json.NewEncoder(w).Encode(payload)
++}
+diff --git a/web/backend/api/router.go b/web/backend/api/router.go
+index aeeb01fc..f3a85e49 100644
+--- a/web/backend/api/router.go
++++ b/web/backend/api/router.go
+@@ -79,6 +79,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+ 	// Config CRUD
+ 	h.registerConfigRoutes(mux)
+ 
++	// Agent tree / profile management (Advanced Settings)
++	h.registerAgentTreeRoutes(mux)
++
+ 	// Pico Channel (WebSocket chat)
+ 	h.registerPicoRoutes(mux)
+ 
+diff --git a/web/frontend/src/components/config/advanced-config-page.tsx b/web/frontend/src/components/config/advanced-config-page.tsx
+index d188ad83..9ceada16 100644
+--- a/web/frontend/src/components/config/advanced-config-page.tsx
++++ b/web/frontend/src/components/config/advanced-config-page.tsx
+@@ -80,6 +80,123 @@ function asFloat(v: string, fallback: number): number {
+   return Number.isFinite(n) ? n : fallback
+ }
+ 
++interface AgentRowDraft {
++  id: string
++  name: string
++  model: string
++  skills: string
++  isDefault: boolean
++}
++
++interface AgentTreeDraft {
++  description: string
++  modelName: string
++  provider: string
++  imageModel: string
++  maxTokens: string
++  contextWindow: string
++  temperature: string
++  maxToolIterations: string
++  agents: AgentRowDraft[]
++  dispatchJson: string
++}
++
++const EMPTY_TREE: AgentTreeDraft = {
++  description: "",
++  modelName: "",
++  provider: "",
++  imageModel: "",
++  maxTokens: "",
++  contextWindow: "",
++  temperature: "",
++  maxToolIterations: "",
++  agents: [],
++  dispatchJson: "[]",
++}
++
++function readDispatchJson(raw: unknown): string {
++  if (!raw || typeof raw !== "object") return "[]"
++  const rules = (raw as Record<string, unknown>).rules
++  if (!Array.isArray(rules)) return "[]"
++  return JSON.stringify(rules, null, 2)
++}
++
++function treeFromRaw(raw: unknown): AgentTreeDraft {
++  if (!raw || typeof raw !== "object") return { ...EMPTY_TREE }
++  const r = raw as Record<string, any>
++  const defaults = r.defaults ?? {}
++  const list: any[] = Array.isArray(r.list) ? r.list : []
++  return {
++    description: typeof r.description === "string" ? r.description : "",
++    modelName:
++      typeof defaults.model_name === "string" ? defaults.model_name : "",
++    provider: typeof defaults.provider === "string" ? defaults.provider : "",
++    imageModel:
++      typeof defaults.image_model === "string" ? defaults.image_model : "",
++    maxTokens:
++      defaults.max_tokens != null ? String(defaults.max_tokens) : "",
++    contextWindow:
++      defaults.context_window != null ? String(defaults.context_window) : "",
++    temperature:
++      defaults.temperature != null ? String(defaults.temperature) : "",
++    maxToolIterations:
++      defaults.max_tool_iterations != null
++        ? String(defaults.max_tool_iterations)
++        : "",
++    agents: list.map((a) => ({
++      id: typeof a.id === "string" ? a.id : "",
++      name: typeof a.name === "string" ? a.name : "",
++      model:
++        typeof a.model === "string"
++          ? a.model
++          : typeof a.model?.primary === "string"
++            ? a.model.primary
++            : "",
++      skills: Array.isArray(a.skills) ? a.skills.join(", ") : "",
++      isDefault: Boolean(a.default),
++    })),
++    dispatchJson: readDispatchJson(r.dispatch),
++  }
++}
++
++function parseDispatchRules(jsonText: string): unknown {
++  const t = jsonText.trim()
++  if (t === "") return null
++  const parsed: unknown = JSON.parse(t)
++  if (!Array.isArray(parsed)) {
++    throw new Error("dispatch rules must be a JSON array")
++  }
++  return { rules: parsed }
++}
++
++function treeToPatch(draft: AgentTreeDraft): Record<string, unknown> {
++  return {
++    description: draft.description,
++    defaults: {
++      model_name: draft.modelName.trim() === "" ? null : draft.modelName.trim(),
++      provider: draft.provider.trim() === "" ? null : draft.provider.trim(),
++      image_model:
++        draft.imageModel.trim() === "" ? null : draft.imageModel.trim(),
++      max_tokens: asInt(draft.maxTokens, 0) || null,
++      context_window: asInt(draft.contextWindow, 0) || null,
++      temperature:
++        draft.temperature.trim() === "" ? null : asFloat(draft.temperature, 0),
++      max_tool_iterations: asInt(draft.maxToolIterations, 0) || null,
++    },
++    list: draft.agents.map((a) => ({
++      id: a.id.trim(),
++      name: a.name.trim() === "" ? null : a.name.trim(),
++      default: a.isDefault,
++      model: a.model.trim() === "" ? null : a.model.trim(),
++      skills: a.skills
++        .split(",")
++        .map((s) => s.trim())
++        .filter((s) => s !== ""),
++    })),
++    dispatch: parseDispatchRules(draft.dispatchJson),
++  }
++}
++
+ export function AdvancedConfigPage() {
+   const { t } = useTranslation()
+   const queryClient = useQueryClient()
+@@ -94,6 +211,11 @@ export function AdvancedConfigPage() {
+   const [routingLightModel, setRoutingLightModel] = useState("")
+   const [routingThreshold, setRoutingThreshold] = useState("0.6")
+   const [baseline, setBaseline] = useState<string>("")
++  const [treeSel, setTreeSel] = useState<string>("live")
++  const [treeDraft, setTreeDraft] = useState<AgentTreeDraft>({ ...EMPTY_TREE })
++  const [treeBaseline, setTreeBaseline] = useState("")
++  const [treeLoadedFor, setTreeLoadedFor] = useState<string>("")
++  const [newProfileName, setNewProfileName] = useState("")
+ 
+   const { data, isLoading, error } = useQuery({
+     queryKey: ["config"],
+@@ -140,6 +262,27 @@ export function AdvancedConfigPage() {
+     setRoutingThreshold(String(routing.threshold ?? 0.6))
+   }
+ 
++  const agentsData = (data as Record<string, any>)?.agents ?? {}
++  const profiles = (agentsData.profiles ?? {}) as Record<string, any>
++  const profileNames = Object.keys(profiles).sort()
++  const activeProfile =
++    typeof agentsData.active_profile === "string"
++      ? agentsData.active_profile
++      : ""
++
++  if (data && treeLoadedFor !== treeSel) {
++    const raw = treeSel === "live" ? agentsData : profiles[treeSel]
++    if (raw) {
++      const draft = treeFromRaw(raw)
++      setTreeDraft(draft)
++      setTreeBaseline(JSON.stringify(draft))
++      setTreeLoadedFor(treeSel)
++    }
++  }
++
++  const treeDirty =
++    treeBaseline !== "" && JSON.stringify(treeDraft) !== treeBaseline
++
+   const dirty =
+     baseline !== "" &&
+     JSON.stringify({
+@@ -262,6 +405,151 @@ export function AdvancedConfigPage() {
+     }
+   }
+ 
++  const treeApplyMutation = useMutation({
++    mutationFn: async (profile: string) => {
++      const res = await launcherFetch("/api/agents/apply", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ profile }),
++      })
++      if (!res.ok) {
++        const text = await res.text().catch(() => "")
++        throw new Error(text || "Failed to apply profile")
++      }
++      return res.json()
++    },
++    onSuccess: async () => {
++      queryClient.invalidateQueries({ queryKey: ["config"] })
++      await refreshGatewayState({ force: true })
++      toast.success(t("pages.config_advanced.tree_apply_success"))
++    },
++    onError: (err: Error) => {
++      toast.error(err.message || t("pages.config_advanced.tree_apply_failed"))
++    },
++  })
++
++  const treeSaveProfileMutation = useMutation({
++    mutationFn: async (payload: {
++      name: string
++      tree: Record<string, unknown>
++    }) => {
++      const res = await launcherFetch("/api/agents/profile", {
++        method: "PUT",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify(payload),
++      })
++      if (!res.ok) {
++        const text = await res.text().catch(() => "")
++        throw new Error(text || "Failed to save profile")
++      }
++      return res.json()
++    },
++    onSuccess: async () => {
++      queryClient.invalidateQueries({ queryKey: ["config"] })
++      await refreshGatewayState({ force: true })
++      toast.success(t("pages.config_advanced.tree_saved"))
++    },
++    onError: (err: Error) => {
++      toast.error(err.message || t("pages.config_advanced.tree_save_failed"))
++    },
++  })
++
++  const treeDeleteMutation = useMutation({
++    mutationFn: async (profile: string) => {
++      const res = await launcherFetch("/api/agents/profile", {
++        method: "DELETE",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ name: profile }),
++      })
++      if (!res.ok) {
++        const text = await res.text().catch(() => "")
++        throw new Error(text || "Failed to delete profile")
++      }
++      return res.json()
++    },
++    onSuccess: async () => {
++      queryClient.invalidateQueries({ queryKey: ["config"] })
++      await refreshGatewayState({ force: true })
++      toast.success(t("pages.config_advanced.tree_deleted"))
++    },
++    onError: (err: Error) => {
++      toast.error(err.message || t("pages.config_advanced.tree_delete_failed"))
++    },
++  })
++
++  const treeSaving =
++    treeApplyMutation.isPending ||
++    treeSaveProfileMutation.isPending ||
++    treeDeleteMutation.isPending ||
++    mutation.isPending
++
++  function handleTreeSave() {
++    if (treeDraft.agents.some((a) => a.id.trim() === "")) {
++      toast.error(t("pages.config_advanced.tree_agent_id_required"))
++      return
++    }
++    let patch: Record<string, unknown>
++    try {
++      patch = treeToPatch(treeDraft)
++    } catch (e) {
++      toast.error(
++        (e as Error).message || t("pages.config_advanced.tree_dispatch_invalid"),
++      )
++      return
++    }
++    if (treeSel === "live") {
++      // Live tree: description lives on profiles only.
++      const agentsPatch: Record<string, unknown> = { ...patch }
++      delete agentsPatch.description
++      mutation.mutate({ agents: agentsPatch })
++    } else {
++      treeSaveProfileMutation.mutate({ name: treeSel, tree: patch })
++    }
++  }
++
++  function handleTreeApply() {
++    if (treeSel === "live" || treeSel === activeProfile) return
++    treeApplyMutation.mutate(treeSel)
++  }
++
++  function handleTreeDelete() {
++    if (treeSel === "live") return
++    if (!window.confirm(t("pages.config_advanced.tree_delete_confirm"))) return
++    treeDeleteMutation.mutate(treeSel, {
++      onSuccess: () => {
++        setTreeSel("live")
++        setTreeLoadedFor("")
++      },
++    })
++  }
++
++  function handleTreeNew() {
++    const name = newProfileName.trim()
++    if (!name) return
++    let patch: Record<string, unknown>
++    try {
++      patch = treeToPatch(treeDraft)
++    } catch (e) {
++      toast.error(
++        (e as Error).message || t("pages.config_advanced.tree_dispatch_invalid"),
++      )
++      return
++    }
++    setTreeSel(name)
++    setNewProfileName("")
++    treeSaveProfileMutation.mutate({ name, tree: patch })
++  }
++
++  function updateAgentRow(
++    index: number,
++    updater: (row: AgentRowDraft) => AgentRowDraft,
++  ) {
++    setTreeDraft((d) => ({
++      ...d,
++      agents: d.agents.map((row, i) => (i === index ? updater(row) : row)),
++    }))
++  }
++
+   return (
+     <div className="space-y-6">
+       <PageHeader title={t("pages.config_advanced.title")}>
+@@ -306,6 +594,383 @@ export function AdvancedConfigPage() {
+       )}
+       {loaded && !error && (
+         <div className="space-y-6">
++          {/* Agent Trees & Profiles */}
++          <Card size="sm">
++            <CardHeader className="border-border border-b">
++              <CardTitle>{t("pages.config_advanced.trees_title")}</CardTitle>
++              <CardDescription>
++                {t("pages.config_advanced.trees_desc")}
++              </CardDescription>
++            </CardHeader>
++            <CardContent className="pt-0">
++              <div className="divide-border/70 divide-y">
++                <Field
++                  label={t("pages.config_advanced.tree_select")}
++                  hint={t("pages.config_advanced.tree_select_hint")}
++                  layout="setting-row"
++                >
++                  <div className="flex w-full items-center gap-2">
++                    <Select value={treeSel} onValueChange={setTreeSel}>
++                      <SelectTrigger className="h-9">
++                        <SelectValue />
++                      </SelectTrigger>
++                      <SelectContent>
++                        <SelectItem value="live">
++                          {t("pages.config_advanced.tree_live")}
++                        </SelectItem>
++                        {profileNames.map((p) => (
++                          <SelectItem key={p} value={p}>
++                            {p}
++                            {p === activeProfile
++                              ? ` (${t("pages.config_advanced.tree_active")})`
++                              : ""}
++                          </SelectItem>
++                        ))}
++                      </SelectContent>
++                    </Select>
++                    {treeSel !== "live" && (
++                      <Button
++                        variant="secondary"
++                        size="sm"
++                        onClick={handleTreeApply}
++                        disabled={
++                          treeSel === activeProfile || treeSaving
++                        }
++                      >
++                        {t("pages.config_advanced.tree_apply")}
++                      </Button>
++                    )}
++                  </div>
++                </Field>
++
++                <Field
++                  label={t("pages.config_advanced.tree_description")}
++                  hint={t("pages.config_advanced.tree_description_hint")}
++                  layout="setting-row"
++                >
++                  <Input
++                    className="h-9"
++                    value={treeDraft.description}
++                    onChange={(e) =>
++                      setTreeDraft((d) => ({
++                        ...d,
++                        description: e.target.value,
++                      }))
++                    }
++                    placeholder={t("pages.config_advanced.tree_description_placeholder")}
++                  />
++                </Field>
++
++                <div className="py-3">
++                  <p className="text-foreground mb-2 text-sm font-medium">
++                    {t("pages.config_advanced.tree_defaults_title")}
++                  </p>
++                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
++                    <Field
++                      label={t("pages.config_advanced.model_name")}
++                      layout="default"
++                    >
++                      <Input
++                        className="h-9"
++                        value={treeDraft.modelName}
++                        onChange={(e) =>
++                          setTreeDraft((d) => ({
++                            ...d,
++                            modelName: e.target.value,
++                          }))
++                        }
++                        placeholder="openrouter-flash-byok"
++                      />
++                    </Field>
++                    <Field
++                      label={t("pages.config_advanced.provider")}
++                      layout="default"
++                    >
++                      <Input
++                        className="h-9"
++                        value={treeDraft.provider}
++                        onChange={(e) =>
++                          setTreeDraft((d) => ({
++                            ...d,
++                            provider: e.target.value,
++                          }))
++                        }
++                        placeholder="openrouter"
++                      />
++                    </Field>
++                    <Field
++                      label={t("pages.config_advanced.image_model")}
++                      layout="default"
++                    >
++                      <Input
++                        className="h-9"
++                        value={treeDraft.imageModel}
++                        onChange={(e) =>
++                          setTreeDraft((d) => ({
++                            ...d,
++                            imageModel: e.target.value,
++                          }))
++                        }
++                        placeholder="skynet-qwen3-vl"
++                      />
++                    </Field>
++                    <Field
++                      label={t("pages.config_advanced.max_tokens")}
++                      layout="default"
++                    >
++                      <Input
++                        className="h-9"
++                        type="number"
++                        value={treeDraft.maxTokens}
++                        onChange={(e) =>
++                          setTreeDraft((d) => ({
++                            ...d,
++                            maxTokens: e.target.value,
++                          }))
++                        }
++                      />
++                    </Field>
++                    <Field
++                      label={t("pages.config_advanced.context_window")}
++                      layout="default"
++                    >
++                      <Input
++                        className="h-9"
++                        type="number"
++                        value={treeDraft.contextWindow}
++                        onChange={(e) =>
++                          setTreeDraft((d) => ({
++                            ...d,
++                            contextWindow: e.target.value,
++                          }))
++                        }
++                      />
++                    </Field>
++                    <Field
++                      label={t("pages.config_advanced.temperature")}
++                      layout="default"
++                    >
++                      <Input
++                        className="h-9"
++                        type="number"
++                        step="0.1"
++                        value={treeDraft.temperature}
++                        onChange={(e) =>
++                          setTreeDraft((d) => ({
++                            ...d,
++                            temperature: e.target.value,
++                          }))
++                        }
++                      />
++                    </Field>
++                    <Field
++                      label={t("pages.config_advanced.max_tool_iterations")}
++                      layout="default"
++                    >
++                      <Input
++                        className="h-9"
++                        type="number"
++                        value={treeDraft.maxToolIterations}
++                        onChange={(e) =>
++                          setTreeDraft((d) => ({
++                            ...d,
++                            maxToolIterations: e.target.value,
++                          }))
++                        }
++                      />
++                    </Field>
++                  </div>
++                </div>
++
++                <div className="py-3">
++                  <div className="mb-2 flex items-center justify-between">
++                    <p className="text-foreground text-sm font-medium">
++                      {t("pages.config_advanced.tree_agents_title")}
++                    </p>
++                    <Button
++                      variant="outline"
++                      size="sm"
++                      onClick={() =>
++                        setTreeDraft((d) => ({
++                          ...d,
++                          agents: [
++                            ...d.agents,
++                            {
++                              id: "",
++                              name: "",
++                              model: "",
++                              skills: "",
++                              isDefault: false,
++                            },
++                          ],
++                        }))
++                      }
++                    >
++                      {t("pages.config_advanced.tree_add_agent")}
++                    </Button>
++                  </div>
++                  <div className="space-y-2">
++                    {treeDraft.agents.length === 0 && (
++                      <p className="text-muted-foreground text-xs">
++                        {t("pages.config_advanced.tree_no_agents")}
++                      </p>
++                    )}
++                    {treeDraft.agents.map((row, idx) => (
++                      <div
++                        key={idx}
++                        className="border-border/70 bg-muted/30 grid grid-cols-1 items-end gap-2 rounded-md border p-2 md:grid-cols-[1fr_1fr_1fr_1fr_auto_auto]"
++                      >
++                        <Field
++                          label={t("pages.config_advanced.agent_id")}
++                          layout="default"
++                        >
++                          <Input
++                            className="h-9"
++                            value={row.id}
++                            onChange={(e) =>
++                              updateAgentRow(idx, (r) => ({
++                                ...r,
++                                id: e.target.value,
++                              }))
++                            }
++                            placeholder="main"
++                          />
++                        </Field>
++                        <Field
++                          label={t("pages.config_advanced.agent_name")}
++                          layout="default"
++                        >
++                          <Input
++                            className="h-9"
++                            value={row.name}
++                            onChange={(e) =>
++                              updateAgentRow(idx, (r) => ({
++                                ...r,
++                                name: e.target.value,
++                              }))
++                            }
++                          />
++                        </Field>
++                        <Field
++                          label={t("pages.config_advanced.agent_model")}
++                          layout="default"
++                        >
++                          <Input
++                            className="h-9"
++                            value={row.model}
++                            onChange={(e) =>
++                              updateAgentRow(idx, (r) => ({
++                                ...r,
++                                model: e.target.value,
++                              }))
++                            }
++                            placeholder="openrouter-flash-byok"
++                          />
++                        </Field>
++                        <Field
++                          label={t("pages.config_advanced.agent_skills")}
++                          layout="default"
++                        >
++                          <Input
++                            className="h-9"
++                            value={row.skills}
++                            onChange={(e) =>
++                              updateAgentRow(idx, (r) => ({
++                                ...r,
++                                skills: e.target.value,
++                              }))
++                            }
++                            placeholder="summarize, weather"
++                          />
++                        </Field>
++                        <label className="flex h-9 cursor-pointer items-center gap-1.5 text-sm">
++                          <input
++                            type="checkbox"
++                            checked={row.isDefault}
++                            onChange={(e) =>
++                              updateAgentRow(idx, (r) => ({
++                                ...r,
++                                isDefault: e.target.checked,
++                              }))
++                            }
++                          />
++                          {t("pages.config_advanced.agent_default")}
++                        </label>
++                        <Button
++                          variant="ghost"
++                          size="sm"
++                          onClick={() =>
++                            setTreeDraft((d) => ({
++                              ...d,
++                              agents: d.agents.filter((_, i) => i !== idx),
++                            }))
++                          }
++                        >
++                          {t("pages.config_advanced.tree_remove_agent")}
++                        </Button>
++                      </div>
++                    ))}
++                  </div>
++                </div>
++
++                <Field
++                  label={t("pages.config_advanced.tree_dispatch")}
++                  hint={t("pages.config_advanced.tree_dispatch_hint")}
++                  layout="setting-row"
++                  controlClassName="md:max-w-[28rem]"
++                >
++                  <Textarea
++                    className="font-mono min-h-[90px] text-xs"
++                    value={treeDraft.dispatchJson}
++                    onChange={(e) =>
++                      setTreeDraft((d) => ({
++                        ...d,
++                        dispatchJson: e.target.value,
++                      }))
++                    }
++                  />
++                </Field>
++
++                <div className="flex flex-wrap items-center gap-2 py-3">
++                  <Button
++                    onClick={handleTreeSave}
++                    disabled={!treeDirty || treeSaving}
++                  >
++                    {treeSaving
++                      ? t("common.saving")
++                      : t("pages.config_advanced.tree_save")}
++                  </Button>
++                  {treeSel !== "live" && (
++                    <Button
++                      variant="destructive"
++                      size="sm"
++                      onClick={handleTreeDelete}
++                      disabled={treeSaving}
++                    >
++                      {t("pages.config_advanced.tree_delete")}
++                    </Button>
++                  )}
++                  <div className="ml-auto flex items-center gap-2">
++                    <Input
++                      className="h-9 w-44"
++                      value={newProfileName}
++                      onChange={(e) => setNewProfileName(e.target.value)}
++                      placeholder={t("pages.config_advanced.tree_new_placeholder")}
++                    />
++                    <Button
++                      variant="outline"
++                      size="sm"
++                      onClick={handleTreeNew}
++                      disabled={!newProfileName.trim() || treeSaving}
++                    >
++                      {t("pages.config_advanced.tree_new")}
++                    </Button>
++                  </div>
++                </div>
++              </div>
++            </CardContent>
++          </Card>
++
+           {/* Context manager */}
+           <Card size="sm">
+             <CardHeader className="border-border border-b">
+diff --git a/web/frontend/src/i18n/locales/en.json b/web/frontend/src/i18n/locales/en.json
+index bc4b6995..80904edb 100644
+--- a/web/frontend/src/i18n/locales/en.json
++++ b/web/frontend/src/i18n/locales/en.json
+@@ -1011,7 +1011,48 @@
+       "routing_light_model": "Light model",
+       "routing_light_model_hint": "Model used for simple requests.",
+       "routing_threshold": "Threshold",
+-      "routing_threshold_hint": "Complexity threshold (0..1). Higher = more requests routed to the main model."
++      "routing_threshold_hint": "Complexity threshold (0..1). Higher = more requests routed to the main model.",
++      "trees_title": "Agent Trees & Profiles",
++      "trees_desc": "Named agent-tree profiles. Apply a profile to swap the whole routing tree, or edit a tree here and save it back to the profile.",
++      "tree_select": "Tree",
++      "tree_select_hint": "Choose the live tree or a saved profile to edit.",
++      "tree_live": "Live tree",
++      "tree_active": "active",
++      "tree_apply": "Apply",
++      "tree_apply_success": "Profile applied.",
++      "tree_apply_failed": "Failed to apply profile.",
++      "tree_description": "Description",
++      "tree_description_hint": "Shown in the profile selector. Live trees usually leave this empty.",
++      "tree_description_placeholder": "Cheap & fast routing tree",
++      "tree_defaults_title": "Defaults",
++      "tree_agents_title": "Agents",
++      "tree_no_agents": "No agents yet — add one below.",
++      "tree_add_agent": "Add agent",
++      "tree_remove_agent": "Remove",
++      "tree_dispatch": "Dispatch rules (JSON)",
++      "tree_dispatch_hint": "Array of dispatch rules as JSON (agents.dispatch.rules). Invalid JSON blocks saving.",
++      "tree_save": "Save tree",
++      "tree_saved": "Agent tree saved.",
++      "tree_save_failed": "Failed to save agent tree.",
++      "tree_delete": "Delete profile",
++      "tree_delete_confirm": "Delete this profile? The live tree is not affected.",
++      "tree_deleted": "Profile deleted.",
++      "tree_delete_failed": "Failed to delete profile.",
++      "tree_new": "New profile",
++      "tree_new_placeholder": "New profile name",
++      "tree_agent_id_required": "Every agent needs an ID.",
++      "tree_dispatch_invalid": "Dispatch rules must be valid JSON.",
++      "model_name": "Model",
++      "provider": "Provider",
++      "max_tokens": "Max tokens",
++      "context_window": "Context window",
++      "temperature": "Temperature",
++      "max_tool_iterations": "Max tool iterations",
++      "agent_id": "ID",
++      "agent_name": "Name",
++      "agent_model": "Model",
++      "agent_skills": "Skills",
++      "agent_default": "Default"
+     }
+   },
+   "tour": {
+-- 
+2.47.3
+

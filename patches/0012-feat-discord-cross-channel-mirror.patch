@@ -1,0 +1,159 @@
+From 271572c8926a570eff3dc05df7279d296356e0fd Mon Sep 17 00:00:00 2001
+From: picoclaw <picoclaw@localhost>
+Date: Tue, 25 Aug 2026 00:04:18 -0400
+Subject: [PATCH] feat(agent): mirror reasoning + tool feedback to Discord
+ channels from any source channel
+
+Add mirrorAuxiliaryToDiscord: when the Discord channel has dedicated
+reasoning_channel_id / tool_channel_id configured, publish a copy of
+reasoning thoughts and tool feedback to those channels regardless of
+which channel the conversation happens on (e.g. the pico launcher UI).
+
+Previously the Discord routing only applied when the conversation itself
+originated on Discord; pico-originated chats never posted reasoning or
+tool calls to Discord.
+---
+ pkg/agent/agent_outbound.go   | 92 +++++++++++++++++++++++++++++++++++
+ pkg/agent/pipeline_execute.go |  4 ++
+ 2 files changed, 96 insertions(+)
+
+diff --git a/pkg/agent/agent_outbound.go b/pkg/agent/agent_outbound.go
+index b19ea75a..8b6f24e4 100644
+--- a/pkg/agent/agent_outbound.go
++++ b/pkg/agent/agent_outbound.go
+@@ -143,6 +143,90 @@ func (al *AgentLoop) publishPicoReasoning(
+ 			})
+ 		}
+ 	}
++
++	// Mirror reasoning to the dedicated Discord reasoning channel (cross-channel).
++	al.mirrorAuxiliaryToDiscord(ctx, messageKindThought, reasoningContent, "pico")
++}
++
++
++// formatVisibleToolCallsForDiscord renders visible tool calls as a compact
++// Discord-friendly text block (one line per tool call).
++func formatVisibleToolCallsForDiscord(visible []utils.VisibleToolCall) string {
++	if len(visible) == 0 {
++		return ""
++	}
++	var sb strings.Builder
++	for i, vc := range visible {
++		if i > 0 {
++			sb.WriteString("\n")
++		}
++		name := ""
++		args := ""
++		if vc.Function != nil {
++			name = strings.TrimSpace(vc.Function.Name)
++			args = strings.TrimSpace(vc.Function.Arguments)
++		}
++		line := "🔧 `" + name + "`"
++		if args != "" {
++			line += " " + utils.Truncate(args, 200)
++		}
++		sb.WriteString(line)
++	}
++	return sb.String()
++}
++
++
++// mirrorAuxiliaryToDiscord publishes a copy of auxiliary agent output
++// (reasoning thoughts or tool feedback) to the Discord channel's dedicated
++// reasoning/tool channels when configured. This lets users watch reasoning
++// and tool calls in Discord regardless of the channel the conversation is on
++// (e.g. the pico launcher UI). Messages are published as plain outbound
++// messages to the target channel ID (no special message kind), which avoids
++// animation/tracking state that would otherwise never be finalized.
++func (al *AgentLoop) mirrorAuxiliaryToDiscord(
++	ctx context.Context,
++	kind, content, sourceChannel string,
++) {
++	if al == nil || al.bus == nil || al.channelManager == nil {
++		return
++	}
++	if strings.TrimSpace(content) == "" {
++		return
++	}
++	if sourceChannel == "discord" {
++		return // discord already routes internally
++	}
++	ch, ok := al.channelManager.GetChannel("discord")
++	if !ok || ch == nil {
++		return
++	}
++	var chatID string
++	switch kind {
++	case messageKindThought:
++		chatID = ch.ReasoningChannelID()
++	case messageKindToolFeedback:
++		chatID = ch.ToolChannelID()
++	default:
++		return
++	}
++	if strings.TrimSpace(chatID) == "" {
++		return
++	}
++	pubCtx, pubCancel := context.WithTimeout(ctx, 3*time.Second)
++	defer pubCancel()
++	if err := al.bus.PublishOutbound(pubCtx, bus.OutboundMessage{
++		Context: bus.InboundContext{
++			Channel: "discord",
++			ChatID:  chatID,
++		},
++		Content: content,
++	}); err != nil && !errors.Is(err, context.DeadlineExceeded) &&
++		!errors.Is(err, context.Canceled) && !errors.Is(err, bus.ErrBusClosed) {
++		logger.DebugCF("agent", "Discord mirror publish skipped", map[string]any{
++			"kind":  kind,
++			"error": err.Error(),
++		})
++	}
+ }
+ 
+ func (al *AgentLoop) publishPicoToolCallInterim(
+@@ -247,6 +331,11 @@ func (al *AgentLoop) publishPicoToolCallInterim(
+ 			"error":   err.Error(),
+ 		})
+ 	}
++
++	// Mirror tool calls to the dedicated Discord tool channel (cross-channel).
++	if mirrored := formatVisibleToolCallsForDiscord(visibleToolCalls); mirrored != "" {
++		al.mirrorAuxiliaryToDiscord(ctx, messageKindToolFeedback, mirrored, ts.channel)
++	}
+ }
+ 
+ func (al *AgentLoop) handleReasoning(
+@@ -292,4 +381,7 @@ func (al *AgentLoop) handleReasoning(
+ 			})
+ 		}
+ 	}
++
++	// Mirror reasoning to the dedicated Discord reasoning channel (cross-channel).
++	al.mirrorAuxiliaryToDiscord(ctx, messageKindThought, reasoningContent, channelName)
+ }
+diff --git a/pkg/agent/pipeline_execute.go b/pkg/agent/pipeline_execute.go
+index 59e33317..c19e2b9a 100644
+--- a/pkg/agent/pipeline_execute.go
++++ b/pkg/agent/pipeline_execute.go
+@@ -216,6 +216,8 @@ toolLoop:
+ 							outboundTurnMessageOptions{kind: messageKindToolFeedback},
+ 						))
+ 						fbCancel()
++						// Mirror tool feedback to the dedicated Discord tool channel (cross-channel).
++						al.mirrorAuxiliaryToDiscord(turnCtx, messageKindToolFeedback, feedbackMsg, ts.channel)
+ 					}
+ 
+ 					toolDuration := time.Duration(0)
+@@ -508,6 +510,8 @@ toolLoop:
+ 				outboundTurnMessageOptions{kind: messageKindToolFeedback},
+ 			))
+ 			fbCancel()
++			// Mirror tool feedback to the dedicated Discord tool channel (cross-channel).
++			al.mirrorAuxiliaryToDiscord(turnCtx, messageKindToolFeedback, feedbackMsg, ts.channel)
+ 		}
+ 
+ 		toolCallID := tc.ID
+-- 
+2.47.3
+

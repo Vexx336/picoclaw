@@ -1,0 +1,30 @@
+From 961708d925d3b1490705304e7380d10e5b004b18 Mon Sep 17 00:00:00 2001
+From: root <root@Skynet>
+Date: Mon, 24 Aug 2026 20:24:06 -0400
+Subject: [PATCH] fix(config): apply active_profile at LoadConfig so profile
+ defaults merge into live agents block
+
+Restart previously left the live defaults untouched (image_model stayed
+openrouter-auto), so media turns routed to a non-multimodal model and
+failed with "does not support image input".
+---
+ pkg/config/config.go | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 209bac27..0a250d04 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -1598,6 +1598,9 @@ func LoadConfig(path string) (*Config, error) {
+ 	cfg.Session.ApplyDmScope()
+ 	cfg.Session.DeriveDmScope()
+ 
++	// Apply active_profile so profile defaults merge into the live agents block
++	cfg.Agents.ApplyProfile(cfg.Agents.ActiveProfile)
++
+ 	return cfg, nil
+ }
+ 
+-- 
+2.47.3
+

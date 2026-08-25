@@ -1,0 +1,1479 @@
+From 12bba29bca18e065316f02fe81f3d4cbc1aabcc4 Mon Sep 17 00:00:00 2001
+From: picoclaw <picoclaw@local>
+Date: Thu, 20 Aug 2026 15:50:13 -0400
+Subject: [PATCH 1/8] feat(embeddings): add pkg/embeddings client, index, store
+ (M1)
+
+Pure-Go semantic memory support for seahorse:
+- client.go: llama.cpp /v1/embeddings HTTP client (float+base64, batch, retry)
+- index.go: flat cosine nearest-neighbor index (pre-normalized)
+- store.go: message_embeddings SQLite table + backfill helpers
+- unit tests (client/index/store) + env-gated live smoke test vs skynet :18084
+- gofmt/go vet clean; race detector green
+---
+ pkg/embeddings/README.md      |  67 +++++++
+ pkg/embeddings/client.go      | 239 ++++++++++++++++++++++++
+ pkg/embeddings/client_test.go | 184 ++++++++++++++++++
+ pkg/embeddings/index.go       | 135 ++++++++++++++
+ pkg/embeddings/index_test.go  | 146 +++++++++++++++
+ pkg/embeddings/live_test.go   |  63 +++++++
+ pkg/embeddings/store.go       | 225 ++++++++++++++++++++++
+ pkg/embeddings/store_test.go  | 338 ++++++++++++++++++++++++++++++++++
+ 8 files changed, 1397 insertions(+)
+ create mode 100644 pkg/embeddings/README.md
+ create mode 100644 pkg/embeddings/client.go
+ create mode 100644 pkg/embeddings/client_test.go
+ create mode 100644 pkg/embeddings/index.go
+ create mode 100644 pkg/embeddings/index_test.go
+ create mode 100644 pkg/embeddings/live_test.go
+ create mode 100644 pkg/embeddings/store.go
+ create mode 100644 pkg/embeddings/store_test.go
+
+diff --git a/pkg/embeddings/README.md b/pkg/embeddings/README.md
+new file mode 100644
+index 00000000..bfa025a0
+--- /dev/null
++++ b/pkg/embeddings/README.md
+@@ -0,0 +1,67 @@
++# pkg/embeddings
++
++Pure-Go (no CGO) semantic memory support for the seahorse context manager.
++
++Three small pieces:
++
++| File | Purpose |
++|---|---|
++| `client.go` | HTTP client for llama.cpp's OpenAI-compatible `/v1/embeddings` (float or base64 responses, batching, retry, dim validation) |
++| `index.go` | In-memory flat nearest-neighbor index (cosine similarity; pre-normalized vectors) |
++| `store.go` | `message_embeddings` table in the same SQLite DB as seahorse, with backfill helpers (`PendingIDs`, `GetContent`, `LoadIndex`) |
++
++## Why flat index?
++
++At ~27k messages × 1024 dims, a brute-force cosine query is a few million
++multiply-adds — single-digit milliseconds on any modern CPU. HNSW adds
++complexity and tuning for no measurable win at this scale. If index load or
++query time ever becomes a problem, swap the `Index` implementation; the
++interface (`Add` / `Remove` / `Search`) is small and stable.
++
++## Why the schema is model-agnostic
++
++Each row records `model` and `dim`, so swapping the embedding model (e.g.
++English-only → multilingual) invalidates old rows by `model` and triggers a
++clean re-embed with zero schema change. `LoadIndex` only loads vectors for the
++configured model.
++
++## Foreign keys
++
++`message_embeddings.message_id` references `messages(message_id) ON DELETE
++CASCADE`, but SQLite only enforces FKs when `PRAGMA foreign_keys = ON` per
++connection. `Migrate` runs the pragma on its connection, but when sharing a
++pooled `*sql.DB` with the seahorse engine you must enable it at the DSN:
++
++```go
++sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
++```
++
++or call `Store.Delete` explicitly when seahorse deletes messages (M2 wiring).
++
++## Usage sketch (M2 integration)
++
++```go
++// Open/store
++db := engineDB // shared with seahorse
++store, err := embeddings.NewStore(ctx, db, "jina-embeddings-v3", 1024)
++
++// Client
++client := embeddings.NewClient("http://100.88.1.92:18084/v1", "jina-embeddings-v3", 1024)
++
++// Write path (async)
++vec, err := client.Embed(ctx, messageText)
++store.Upsert(ctx, messageID, vec)
++
++// Query path
++qvec, _ := client.Embed(ctx, userQuery)
++index, _ := store.LoadIndex(ctx)      // at engine start
++hits := index.Search(qvec, 8, 0.35)   // top-8, min score 0.35
++```
++
++## Tests
++
++```bash
++go test ./pkg/embeddings/ -count=1          # unit tests (no network)
++go test ./pkg/embeddings/ -count=1 -race    # race detector
++EMB_LIVE=1 go test ./pkg/embeddings/ -run TestLiveSkynet -v  # live smoke vs skynet
++```
+diff --git a/pkg/embeddings/client.go b/pkg/embeddings/client.go
+new file mode 100644
+index 00000000..cbf06c83
+--- /dev/null
++++ b/pkg/embeddings/client.go
+@@ -0,0 +1,239 @@
++// Package embeddings provides a pure-Go client for llama.cpp's
++// OpenAI-compatible /v1/embeddings endpoint, plus an in-memory flat index
++// and a SQLite-backed vector store. It is used by the seahorse context
++// manager to add semantic retrieval over chat history.
++//
++// No CGO and no external runtime dependencies: the HTTP client uses only
++// net/http, and the store rides on the same modernc.org/sqlite driver the
++// seahorse engine already uses.
++package embeddings
++
++import (
++	"bytes"
++	"context"
++	"encoding/base64"
++	"encoding/binary"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"math"
++	"net/http"
++	"strings"
++	"time"
++)
++
++// Client talks to a llama.cpp llama-server running with --embedding.
++//
++// The endpoint is OpenAI-compatible:
++//
++//	POST {BaseURL}/v1/embeddings
++//	{"input": ["text"], "model": "jina-embeddings-v3", "encoding_format": "float"}
++//
++// Response:
++//
++//	{"data":[{"object":"embedding","index":0,"embedding":[...]}],"model":"...","usage":{"prompt_tokens":N,"total_tokens":N}}
++type Client struct {
++	BaseURL    string        // e.g. "http://100.88.1.92:18084/v1"
++	Model      string        // model name passed to llama.cpp (informational; server may ignore)
++	Dim        int           // expected embedding dimension; mismatches are an error
++	HTTPClient *http.Client  // optional; defaults to a 60s-timeout client
++	MaxRetries int           // additional attempts after the first (default 1)
++	RetryDelay time.Duration // delay between retries (default 250ms)
++}
++
++// DefaultTimeout is applied to the HTTP client when none is provided.
++const DefaultTimeout = 60 * time.Second
++
++// DefaultRetryDelay is the pause between retry attempts.
++const DefaultRetryDelay = 250 * time.Millisecond
++
++// ErrDimMismatch is returned when the server returns vectors of a different
++// dimension than the configured one (e.g. after a model swap on the server).
++var ErrDimMismatch = errors.New("embeddings: dimension mismatch")
++
++// ErrEmptyInput is returned when Embed/EmbedBatch receives no texts.
++var ErrEmptyInput = errors.New("embeddings: empty input")
++
++// NewClient builds a client with defaults applied.
++func NewClient(baseURL, model string, dim int) *Client {
++	return &Client{
++		BaseURL:    strings.TrimRight(baseURL, "/"),
++		Model:      model,
++		Dim:        dim,
++		HTTPClient: &http.Client{Timeout: DefaultTimeout},
++		MaxRetries: 1,
++		RetryDelay: DefaultRetryDelay,
++	}
++}
++
++// Embed returns the embedding vector for a single text.
++func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
++	if strings.TrimSpace(text) == "" {
++		return nil, ErrEmptyInput
++	}
++	vecs, err := c.EmbedBatch(ctx, []string{text})
++	if err != nil {
++		return nil, err
++	}
++	return vecs[0], nil
++}
++
++// EmbedBatch returns one embedding vector per input text, in the same order.
++//
++// llama.cpp accepts either a string or an array of strings as "input"; batch
++// requests amortize per-request overhead on the server. The caller must keep
++// batch sizes modest (llama.cpp slots are limited by --parallel).
++func (c *Client) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
++	clean := make([]string, 0, len(texts))
++	for _, t := range texts {
++		if strings.TrimSpace(t) == "" {
++			continue
++		}
++		clean = append(clean, t)
++	}
++	if len(clean) == 0 {
++		return nil, ErrEmptyInput
++	}
++
++	body := map[string]any{
++		"input":           clean,
++		"model":           c.Model,
++		"encoding_format": "float",
++	}
++	payload, err := json.Marshal(body)
++	if err != nil {
++		return nil, fmt.Errorf("embeddings: marshal request: %w", err)
++	}
++
++	url := c.BaseURL + "/embeddings"
++	var lastErr error
++	attempts := c.MaxRetries + 1
++	if attempts < 1 {
++		attempts = 1
++	}
++	for attempt := 0; attempt < attempts; attempt++ {
++		if attempt > 0 {
++			select {
++			case <-ctx.Done():
++				return nil, ctx.Err()
++			case <-time.After(c.retryDelay()):
++			}
++		}
++
++		vecs, err := c.doOnce(ctx, url, payload)
++		if err == nil {
++			return vecs, nil
++		}
++		lastErr = err
++		// Do not retry on dimension mismatch or bad request — it won't fix itself.
++		if errors.Is(err, ErrDimMismatch) || isBadRequest(err) {
++			return nil, err
++		}
++	}
++	return nil, fmt.Errorf("embeddings: after %d attempts: %w", attempts, lastErr)
++}
++
++func (c *Client) doOnce(ctx context.Context, url string, payload []byte) ([][]float32, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++
++	resp, err := c.httpClient().Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
++		return nil, fmt.Errorf("embeddings: server returned %s: %s", resp.Status, strings.TrimSpace(string(msg)))
++	}
++
++	var out embedResponse
++	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&out); err != nil {
++		return nil, fmt.Errorf("embeddings: decode response: %w", err)
++	}
++	if len(out.Data) == 0 {
++		return nil, errors.New("embeddings: empty data array in response")
++	}
++
++	vecs := make([][]float32, len(out.Data))
++	for i, item := range out.Data {
++		v, err := decodeVector(item.Embedding, item.EmbeddingB64, c.Dim)
++		if err != nil {
++			return nil, err
++		}
++		vecs[i] = v
++	}
++	return vecs, nil
++}
++
++// embedResponse mirrors the OpenAI-compatible response shape. llama.cpp may
++// return either a plain float array ("encoding_format": "float") or a base64
++// string ("encoding_format": "base64"); both are handled.
++type embedResponse struct {
++	Data []struct {
++		Object       string          `json:"object"`
++		Index        int             `json:"index"`
++		Embedding    []float32       `json:"embedding,omitempty"`
++		EmbeddingB64 json.RawMessage `json:"embedding_base64,omitempty"`
++	} `json:"data"`
++	Model string `json:"model"`
++	Usage struct {
++		PromptTokens int `json:"prompt_tokens"`
++		TotalTokens  int `json:"total_tokens"`
++	} `json:"usage"`
++}
++
++func (c *Client) httpClient() *http.Client {
++	if c.HTTPClient != nil {
++		return c.HTTPClient
++	}
++	return &http.Client{Timeout: DefaultTimeout}
++}
++
++func (c *Client) retryDelay() time.Duration {
++	if c.RetryDelay > 0 {
++		return c.RetryDelay
++	}
++	return DefaultRetryDelay
++}
++
++func isBadRequest(err error) bool {
++	return err != nil && (strings.Contains(err.Error(), "400 Bad Request") ||
++		strings.Contains(err.Error(), "422 Unprocessable"))
++}
++
++// decodeVector decodes either a float array or a base64 blob into []float32
++// and verifies it matches the expected dimension.
++func decodeVector(floats []float32, b64 json.RawMessage, wantDim int) ([]float32, error) {
++	var vec []float32
++	switch {
++	case len(floats) > 0:
++		vec = floats
++	case len(b64) > 0:
++		raw, err := base64.StdEncoding.DecodeString(strings.Trim(string(b64), `"`))
++		if err != nil {
++			return nil, fmt.Errorf("embeddings: base64 decode: %w", err)
++		}
++		if len(raw)%4 != 0 {
++			return nil, errors.New("embeddings: base64 vector length not a multiple of 4")
++		}
++		vec = make([]float32, len(raw)/4)
++		for i := range vec {
++			bits := binary.LittleEndian.Uint32(raw[i*4 : i*4+4])
++			vec[i] = math.Float32frombits(bits)
++		}
++	default:
++		return nil, errors.New("embeddings: vector missing in response")
++	}
++
++	if wantDim > 0 && len(vec) != wantDim {
++		return nil, fmt.Errorf("%w: got %d, want %d (model changed on server?)",
++			ErrDimMismatch, len(vec), wantDim)
++	}
++	return vec, nil
++}
+diff --git a/pkg/embeddings/client_test.go b/pkg/embeddings/client_test.go
+new file mode 100644
+index 00000000..b8767e82
+--- /dev/null
++++ b/pkg/embeddings/client_test.go
+@@ -0,0 +1,184 @@
++package embeddings
++
++import (
++	"context"
++	"encoding/base64"
++	"encoding/binary"
++	"encoding/json"
++	"errors"
++	"math"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func makeEmbedResponse(t *testing.T, vecs [][]float32, encodeB64 bool) map[string]any {
++	t.Helper()
++	data := make([]any, 0, len(vecs))
++	for i, v := range vecs {
++		item := map[string]any{"object": "embedding", "index": i}
++		if encodeB64 {
++			blob := make([]byte, len(v)*4)
++			for j, x := range v {
++				binary.LittleEndian.PutUint32(blob[j*4:], math.Float32bits(x))
++			}
++			item["embedding_base64"] = base64.StdEncoding.EncodeToString(blob)
++		} else {
++			item["embedding"] = v
++		}
++		data = append(data, item)
++	}
++	return map[string]any{
++		"data":  data,
++		"model": "jina-embeddings-v3",
++		"usage": map[string]any{"prompt_tokens": 5, "total_tokens": 5},
++	}
++}
++
++func TestEmbedFloat(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path != "/v1/embeddings" {
++			t.Errorf("unexpected path %s", r.URL.Path)
++		}
++		var req map[string]any
++		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++			t.Fatal(err)
++		}
++		if req["encoding_format"] != "float" {
++			t.Errorf("expected encoding_format float, got %v", req["encoding_format"])
++		}
++		input, _ := req["input"].([]any)
++		if len(input) == 0 {
++			t.Fatalf("expected at least 1 input")
++		}
++		vecs := make([][]float32, 0, len(input))
++		for i := range input {
++			vecs = append(vecs, []float32{float32(i) + 0.1, float32(i) + 0.2, float32(i) + 0.3})
++		}
++		_ = json.NewEncoder(w).Encode(makeEmbedResponse(t, vecs, false))
++	}))
++	defer srv.Close()
++
++	c := NewClient(srv.URL+"/v1", "jina-embeddings-v3", 3)
++	vecs, err := c.EmbedBatch(context.Background(), []string{"hello", "world"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(vecs) != 2 || len(vecs[0]) != 3 || vecs[0][0] != 0.1 || vecs[1][2] != 1.3 {
++		t.Fatalf("unexpected vectors: %#v", vecs)
++	}
++
++	single, err := c.Embed(context.Background(), "hello")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(single) != 3 || single[0] != 0.1 {
++		t.Fatalf("single embed = %#v, want [0.1 0.2 0.3]", single)
++	}
++}
++
++func TestEmbedBase64(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_ = json.NewEncoder(w).Encode(makeEmbedResponse(t, [][]float32{{1.5, -2.5, 3.25}}, true))
++	}))
++	defer srv.Close()
++
++	c := NewClient(srv.URL+"/v1", "m", 3)
++	vecs, err := c.EmbedBatch(context.Background(), []string{"hi"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if vecs[0][0] != 1.5 || vecs[0][1] != -2.5 || vecs[0][2] != 3.25 {
++		t.Fatalf("unexpected decoded vector: %#v", vecs[0])
++	}
++}
++
++func TestEmbedSkipsEmptyTexts(t *testing.T) {
++	c := NewClient("http://unused", "m", 3)
++	if _, err := c.Embed(context.Background(), ""); !errors.Is(err, ErrEmptyInput) {
++		t.Fatalf("expected ErrEmptyInput, got %v", err)
++	}
++	if _, err := c.EmbedBatch(context.Background(), []string{"", "  "}); !errors.Is(err, ErrEmptyInput) {
++		t.Fatalf("expected ErrEmptyInput for all-empty batch, got %v", err)
++	}
++}
++
++func TestEmbedDimMismatch(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_ = json.NewEncoder(w).Encode(makeEmbedResponse(t, [][]float32{{0.1, 0.2, 0.3}}, false))
++	}))
++	defer srv.Close()
++
++	c := NewClient(srv.URL+"/v1", "m", 5)
++	_, err := c.Embed(context.Background(), "hi")
++	if !errors.Is(err, ErrDimMismatch) {
++		t.Fatalf("expected ErrDimMismatch, got %v", err)
++	}
++}
++
++func TestEmbedRetryOnTransient(t *testing.T) {
++	var calls int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if atomic.AddInt32(&calls, 1) < 3 {
++			http.Error(w, "boom", http.StatusInternalServerError)
++			return
++		}
++		_ = json.NewEncoder(w).Encode(makeEmbedResponse(t, [][]float32{{0.1, 0.2, 0.3}}, false))
++	}))
++	defer srv.Close()
++
++	c := NewClient(srv.URL+"/v1", "m", 3)
++	c.MaxRetries = 3
++	c.RetryDelay = time.Millisecond
++
++	if _, err := c.Embed(context.Background(), "hi"); err != nil {
++		t.Fatalf("expected success after retries, got %v", err)
++	}
++	if got := atomic.LoadInt32(&calls); got != 3 {
++		t.Fatalf("expected 3 calls, got %d", got)
++	}
++}
++
++func TestEmbedNoRetryOnBadRequest(t *testing.T) {
++	var calls int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		atomic.AddInt32(&calls, 1)
++		http.Error(w, "bad input", http.StatusBadRequest)
++	}))
++	defer srv.Close()
++
++	c := NewClient(srv.URL+"/v1", "m", 3)
++	c.MaxRetries = 5
++	c.RetryDelay = time.Millisecond
++
++	if _, err := c.Embed(context.Background(), "hi"); err == nil {
++		t.Fatal("expected error")
++	}
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("expected no retry on 400, got %d calls", got)
++	}
++}
++
++func TestEmbedContextCancel(t *testing.T) {
++	done := make(chan struct{})
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		<-done // hold the connection
++	}))
++	defer srv.Close()
++	defer close(done)
++
++	c := NewClient(srv.URL+"/v1", "m", 3)
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++
++	_, err := c.Embed(ctx, "hi")
++	if err == nil {
++		t.Fatal("expected context error")
++	}
++	if !strings.Contains(err.Error(), "context") && !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("unexpected error: %v", err)
++	}
++}
+diff --git a/pkg/embeddings/index.go b/pkg/embeddings/index.go
+new file mode 100644
+index 00000000..9e3d7f56
+--- /dev/null
++++ b/pkg/embeddings/index.go
+@@ -0,0 +1,135 @@
++package embeddings
++
++import (
++	"math"
++	"sort"
++)
++
++// Hit is a single nearest-neighbor result.
++type Hit struct {
++	MessageID int64   `json:"messageId"`
++	Score     float64 `json:"score"` // cosine similarity, higher is better (1.0 = identical)
++}
++
++// Index is a flat in-memory nearest-neighbor index over message vectors.
++//
++// Flat brute-force is intentional: at ~27k messages × 1024 dims a query is a
++// few million multiply-adds (single-digit milliseconds on any modern CPU).
++// HNSW is only worth adding if index load or query time ever becomes a
++// problem (see proposal §M4).
++type Index struct {
++	dim    int
++	ids    []int64
++	normed [][]float32 // pre-normalized vectors
++}
++
++// NewIndex creates an empty index with a fixed dimension.
++func NewIndex(dim int) *Index {
++	return &Index{dim: dim}
++}
++
++// Len returns the number of vectors in the index.
++func (ix *Index) Len() int { return len(ix.ids) }
++
++// Dim returns the vector dimension of the index.
++func (ix *Index) Dim() int { return ix.dim }
++
++// Add inserts (or replaces) a message vector. Vectors are normalized once at
++// insert time so Search only needs dot products.
++func (ix *Index) Add(messageID int64, vec []float32) {
++	if len(vec) != ix.dim {
++		return // dimension mismatch rows are dropped; store layer logs them
++	}
++	normed := make([]float32, len(vec))
++	copy(normed, vec)
++	normalizeInPlace(normed)
++
++	for i, id := range ix.ids {
++		if id == messageID {
++			ix.normed[i] = normed
++			return
++		}
++	}
++	ix.ids = append(ix.ids, messageID)
++	ix.normed = append(ix.normed, normed)
++}
++
++// Remove deletes a message vector. Removing is O(n); callers should batch
++// deletes or rebuild the index when large fractions change.
++func (ix *Index) Remove(messageID int64) {
++	for i, id := range ix.ids {
++		if id == messageID {
++			ix.ids = append(ix.ids[:i], ix.ids[i+1:]...)
++			ix.normed = append(ix.normed[:i], ix.normed[i+1:]...)
++			return
++		}
++	}
++}
++
++// Search returns the top-k nearest neighbors by cosine similarity. The query
++// vector is normalized internally and not modified.
++//
++// A score of 0 means "no vectors in index". minScore filters out weak hits;
++// pass 0 to skip filtering.
++func (ix *Index) Search(query []float32, topK int, minScore float64) []Hit {
++	if ix.Len() == 0 || len(query) != ix.dim {
++		return nil
++	}
++	q := make([]float32, len(query))
++	copy(q, query)
++	normalizeInPlace(q)
++
++	type scored struct {
++		id    int64
++		score float64
++	}
++	all := make([]scored, 0, ix.Len())
++	for i, id := range ix.ids {
++		s := dot(q, ix.normed[i])
++		if s < minScore {
++			continue
++		}
++		all = append(all, scored{id: id, score: s})
++	}
++	if len(all) == 0 {
++		return nil
++	}
++
++	sort.Slice(all, func(i, j int) bool {
++		return all[i].score > all[j].score
++	})
++	if topK > 0 && len(all) > topK {
++		all = all[:topK]
++	}
++
++	hits := make([]Hit, len(all))
++	for i, s := range all {
++		hits[i] = Hit{MessageID: s.id, Score: s.score}
++	}
++	return hits
++}
++
++// normalizeInPlace scales vec to unit length. Zero vectors stay zero.
++func normalizeInPlace(vec []float32) {
++	var sum float64
++	for _, v := range vec {
++		sum += float64(v) * float64(v)
++	}
++	norm := math.Sqrt(sum)
++	if norm == 0 || math.IsNaN(norm) || math.IsInf(norm, 0) {
++		return
++	}
++	inv := float32(1.0 / norm)
++	for i := range vec {
++		vec[i] *= inv
++	}
++}
++
++// dot computes the dot product of two equal-length vectors.
++func dot(a, b []float32) float64 {
++	var sum float64
++	for i := range a {
++		sum += float64(a[i]) * float64(b[i])
++	}
++	return sum
++}
+diff --git a/pkg/embeddings/index_test.go b/pkg/embeddings/index_test.go
+new file mode 100644
+index 00000000..d504c064
+--- /dev/null
++++ b/pkg/embeddings/index_test.go
+@@ -0,0 +1,146 @@
++package embeddings
++
++import (
++	"math"
++	"testing"
++)
++
++func TestIndexAddAndLen(t *testing.T) {
++	ix := NewIndex(3)
++	if ix.Len() != 0 {
++		t.Fatal("new index should be empty")
++	}
++	ix.Add(1, []float32{1, 0, 0})
++	ix.Add(2, []float32{0, 1, 0})
++	if ix.Len() != 2 {
++		t.Fatalf("len = %d, want 2", ix.Len())
++	}
++}
++
++func TestIndexReplacesOnSameID(t *testing.T) {
++	ix := NewIndex(3)
++	ix.Add(7, []float32{1, 0, 0})
++	ix.Add(7, []float32{0, 1, 0})
++	if ix.Len() != 1 {
++		t.Fatalf("len = %d, want 1 (replace)", ix.Len())
++	}
++	hits := ix.Search([]float32{0, 1, 0}, 1, 0)
++	if len(hits) != 1 || hits[0].MessageID != 7 {
++		t.Fatalf("expected replaced vector for id 7, got %#v", hits)
++	}
++}
++
++func TestIndexDropsDimMismatch(t *testing.T) {
++	ix := NewIndex(3)
++	ix.Add(1, []float32{1, 0}) // wrong dim — dropped
++	if ix.Len() != 0 {
++		t.Fatalf("len = %d, want 0", ix.Len())
++	}
++}
++
++func TestIndexSearchOrdersBySimilarity(t *testing.T) {
++	ix := NewIndex(4)
++	ix.Add(100, []float32{1, 0, 0, 0})
++	ix.Add(200, []float32{0.9, 0.1, 0, 0})
++	ix.Add(300, []float32{0, 0, 1, 0})
++
++	hits := ix.Search([]float32{1, 0, 0, 0}, 3, 0)
++	if len(hits) != 3 {
++		t.Fatalf("got %d hits, want 3", len(hits))
++	}
++	if hits[0].MessageID != 100 {
++		t.Errorf("top hit = %d, want 100", hits[0].MessageID)
++	}
++	if hits[1].MessageID != 200 {
++		t.Errorf("second hit = %d, want 200", hits[1].MessageID)
++	}
++	// Identical vectors should have cosine ≈ 1.0
++	if math.Abs(hits[0].Score-1.0) > 1e-6 {
++		t.Errorf("score = %v, want ~1.0", hits[0].Score)
++	}
++}
++
++func TestIndexTopK(t *testing.T) {
++	ix := NewIndex(2)
++	for i := 1; i <= 10; i++ {
++		v := float32(i) / 10
++		ix.Add(int64(i), []float32{v, 1 - v})
++	}
++	hits := ix.Search([]float32{0.95, 0.05}, 3, 0)
++	if len(hits) != 3 {
++		t.Fatalf("got %d hits, want 3", len(hits))
++	}
++	// 10 (v=1.0) should be the top match, then 9, then 8.
++	if hits[0].MessageID != 10 || hits[1].MessageID != 9 || hits[2].MessageID != 8 {
++		t.Fatalf("unexpected top-3 order: %#v", hits)
++	}
++}
++
++func TestIndexMinScoreFilter(t *testing.T) {
++	ix := NewIndex(2)
++	ix.Add(1, []float32{1, 0})
++	ix.Add(2, []float32{0, 1})
++
++	hits := ix.Search([]float32{1, 0}, 5, 0)
++	if len(hits) != 2 {
++		t.Fatalf("no-filter hits = %d, want 2", len(hits))
++	}
++	// Perpendicular vector {0,1} scores 0.0 against query {1,0}.
++	hits = ix.Search([]float32{1, 0}, 5, 0.01)
++	if len(hits) != 1 || hits[0].MessageID != 1 {
++		t.Fatalf("minScore 0.01 hits = %#v, want only id 1", hits)
++	}
++	hits = ix.Search([]float32{1, 0}, 5, 0.9)
++	if len(hits) != 1 || hits[0].MessageID != 1 {
++		t.Fatalf("minScore 0.9 hits = %#v, want only id 1", hits)
++	}
++}
++
++func TestIndexEmpty(t *testing.T) {
++	ix := NewIndex(3)
++	if hits := ix.Search([]float32{1, 0, 0}, 5, 0); hits != nil {
++		t.Fatalf("empty index should return nil, got %#v", hits)
++	}
++}
++
++func TestIndexRemove(t *testing.T) {
++	ix := NewIndex(3)
++	ix.Add(1, []float32{1, 0, 0})
++	ix.Add(2, []float32{0, 1, 0})
++	ix.Remove(1)
++	if ix.Len() != 1 {
++		t.Fatalf("len = %d, want 1", ix.Len())
++	}
++	hits := ix.Search([]float32{1, 0, 0}, 5, 0.01)
++	for _, h := range hits {
++		if h.MessageID == 1 {
++			t.Fatalf("removed id 1 should not be found, got %#v", hits)
++		}
++	}
++}
++
++func TestIndexSearchDoesNotMutateQuery(t *testing.T) {
++	ix := NewIndex(2)
++	ix.Add(1, []float32{3, 4}) // norm = 5
++	q := []float32{1, 0}
++	_ = ix.Search(q, 5, 0)
++	if q[0] != 1 || q[1] != 0 {
++		t.Fatalf("query was mutated: %#v", q)
++	}
++}
++
++func TestIndexZeroVector(t *testing.T) {
++	ix := NewIndex(2)
++	ix.Add(1, []float32{0, 0})
++	ix.Add(2, []float32{1, 0})
++	hits := ix.Search([]float32{1, 0}, 5, 0)
++	if len(hits) != 2 {
++		t.Fatalf("expected both vectors to remain searchable, got %#v", hits)
++	}
++	// Zero vector has no direction; its score should be 0, not NaN.
++	for _, h := range hits {
++		if math.IsNaN(h.Score) {
++			t.Fatalf("NaN score for %#v", hits)
++		}
++	}
++}
+diff --git a/pkg/embeddings/live_test.go b/pkg/embeddings/live_test.go
+new file mode 100644
+index 00000000..06308f48
+--- /dev/null
++++ b/pkg/embeddings/live_test.go
+@@ -0,0 +1,63 @@
++package embeddings
++
++import (
++	"context"
++	"os"
++	"testing"
++	"time"
++)
++
++// TestLiveSkynet is a live smoke test against the real embedding server on
++// skynet (:18084, jina-embeddings-v3). It is skipped unless EMB_LIVE=1 is
++// set, so `go test ./pkg/embeddings/` stays hermetic.
++//
++// Run with:
++//
++//	EMB_LIVE=1 go test ./pkg/embeddings/ -run TestLiveSkynet -v
++func TestLiveSkynet(t *testing.T) {
++	if os.Getenv("EMB_LIVE") != "1" {
++		t.Skip("set EMB_LIVE=1 to run live test against skynet")
++	}
++	endpoint := os.Getenv("EMB_ENDPOINT")
++	if endpoint == "" {
++		endpoint = "http://100.88.1.92:18084/v1"
++	}
++
++	c := NewClient(endpoint, "jina-embeddings-v3", 1024)
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++
++	start := time.Now()
++	vecs, err := c.EmbedBatch(ctx, []string{
++		"the arc a770 wedges under compute load",
++		"pi-hole dns runs on swarm1 and swarm2",
++		"the p70 uses nvidia driver 580",
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Logf("batch embed took %s, got %d vectors of dim %d",
++		time.Since(start).Round(time.Millisecond), len(vecs), len(vecs[0]))
++
++	if len(vecs) != 3 || len(vecs[0]) != 1024 {
++		t.Fatalf("unexpected shapes: %d vectors, dim %d", len(vecs), len(vecs[0]))
++	}
++
++	// Search against the batch with a related query; the arc message should win.
++	ix := NewIndex(1024)
++	for i, v := range vecs {
++		ix.Add(int64(i+1), v)
++	}
++	qvec, err := c.Embed(ctx, "gpu wedges and resets under compute load")
++	if err != nil {
++		t.Fatal(err)
++	}
++	hits := ix.Search(qvec, 3, 0)
++	if len(hits) == 0 {
++		t.Fatal("no hits from live search")
++	}
++	t.Logf("live hits: %#v", hits)
++	if hits[0].MessageID != 1 {
++		t.Errorf("expected arc message (id 1) to be top hit, got %d", hits[0].MessageID)
++	}
++}
+diff --git a/pkg/embeddings/store.go b/pkg/embeddings/store.go
+new file mode 100644
+index 00000000..40ac0b1b
+--- /dev/null
++++ b/pkg/embeddings/store.go
+@@ -0,0 +1,225 @@
++package embeddings
++
++import (
++	"context"
++	"database/sql"
++	"encoding/binary"
++	"fmt"
++	"math"
++)
++
++// Store persists message embeddings inside the same SQLite database as the
++// seahorse engine (typically sessions/seahorse.db).
++//
++// The schema is model-agnostic: each row records the embedding model name and
++// dimension, so swapping models invalidates old rows by model and triggers a
++// clean re-embed without any schema change.
++type Store struct {
++	db    *sql.DB
++	model string
++	dim   int
++}
++
++// NewStore opens (or reuses) a *sql.DB for the message_embeddings table and
++// ensures the schema exists.
++//
++// db may be shared with the seahorse engine (it just runs CREATE TABLE IF NOT
++// EXISTS statements); pass a dedicated connection if you prefer isolation.
++func NewStore(ctx context.Context, db *sql.DB, model string, dim int) (*Store, error) {
++	s := &Store{db: db, model: model, dim: dim}
++	if err := s.Migrate(ctx); err != nil {
++		return nil, err
++	}
++	return s, nil
++}
++
++// Migrate creates the message_embeddings table and supporting index.
++// Idempotent: safe to call on every startup.
++//
++// Note: SQLite enforces foreign keys only when `PRAGMA foreign_keys = ON`
++// is set on the connection. This runs the pragma for the connection the
++// statement executes on; when sharing a pooled *sql.DB with the seahorse
++// engine, enable it at the DSN level (e.g. `_pragma=foreign_keys(1)` with
++// modernc.org/sqlite) or call Store.Delete explicitly on message removal.
++func (s *Store) Migrate(ctx context.Context) error {
++	stmts := []string{
++		`PRAGMA foreign_keys = ON`,
++		`CREATE TABLE IF NOT EXISTS message_embeddings (
++			message_id  INTEGER PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
++			model       TEXT NOT NULL,
++			dim         INTEGER NOT NULL,
++			vector      BLOB NOT NULL,
++			created_at  TEXT NOT NULL DEFAULT (datetime('now'))
++		)`,
++		`CREATE INDEX IF NOT EXISTS idx_embeddings_model ON message_embeddings(model)`,
++	}
++	for _, stmt := range stmts {
++		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
++			return fmt.Errorf("embeddings: migrate: %w", err)
++		}
++	}
++	return nil
++}
++
++// Model returns the model name this store is configured for.
++func (s *Store) Model() string { return s.model }
++
++// Dim returns the expected vector dimension.
++func (s *Store) Dim() int { return s.dim }
++
++// Upsert inserts or replaces the embedding for one message.
++func (s *Store) Upsert(ctx context.Context, messageID int64, vec []float32) error {
++	if len(vec) != s.dim {
++		return fmt.Errorf("%w: got %d, want %d", ErrDimMismatch, len(vec), s.dim)
++	}
++	blob := encodeVector(vec)
++	_, err := s.db.ExecContext(ctx,
++		`INSERT INTO message_embeddings (message_id, model, dim, vector)
++		 VALUES (?, ?, ?, ?)
++		 ON CONFLICT(message_id) DO UPDATE SET
++		   model = excluded.model,
++		   dim = excluded.dim,
++		   vector = excluded.vector,
++		   created_at = datetime('now')`,
++		messageID, s.model, s.dim, blob)
++	if err != nil {
++		return fmt.Errorf("embeddings: upsert: %w", err)
++	}
++	return nil
++}
++
++// Delete removes the embedding for one message.
++func (s *Store) Delete(ctx context.Context, messageID int64) error {
++	_, err := s.db.ExecContext(ctx,
++		`DELETE FROM message_embeddings WHERE message_id = ?`, messageID)
++	if err != nil {
++		return fmt.Errorf("embeddings: delete: %w", err)
++	}
++	return nil
++}
++
++// Count returns the number of stored vectors (all models).
++func (s *Store) Count(ctx context.Context) (int, error) {
++	var n int
++	if err := s.db.QueryRowContext(ctx,
++		`SELECT COUNT(*) FROM message_embeddings`).Scan(&n); err != nil {
++		return 0, fmt.Errorf("embeddings: count: %w", err)
++	}
++	return n, nil
++}
++
++// CountForModel returns the number of vectors for the configured model.
++func (s *Store) CountForModel(ctx context.Context) (int, error) {
++	var n int
++	if err := s.db.QueryRowContext(ctx,
++		`SELECT COUNT(*) FROM message_embeddings WHERE model = ?`, s.model).Scan(&n); err != nil {
++		return 0, fmt.Errorf("embeddings: count for model: %w", err)
++	}
++	return n, nil
++}
++
++// LoadIndex streams all vectors for the configured model into a flat Index.
++// Called once at engine start; ~27k rows × 1KB ≈ 27MB of BLOBs, well under
++// the 1MB exec output cap when run outside this tool.
++func (s *Store) LoadIndex(ctx context.Context) (*Index, error) {
++	ix := NewIndex(s.dim)
++	rows, err := s.db.QueryContext(ctx,
++		`SELECT message_id, vector FROM message_embeddings WHERE model = ?`, s.model)
++	if err != nil {
++		return nil, fmt.Errorf("embeddings: load index: %w", err)
++	}
++	defer rows.Close()
++
++	for rows.Next() {
++		var (
++			id   int64
++			blob []byte
++		)
++		if err := rows.Scan(&id, &blob); err != nil {
++			return nil, fmt.Errorf("embeddings: scan row: %w", err)
++		}
++		vec, err := decodeVectorBlob(blob, s.dim)
++		if err != nil {
++			// Skip malformed rows; they can be re-embedded in a backfill.
++			continue
++		}
++		ix.Add(id, vec)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, fmt.Errorf("embeddings: iterate rows: %w", err)
++	}
++	return ix, nil
++}
++
++// PendingIDs returns message IDs that have no embedding for the configured
++// model, optionally limited to a conversation. Used by the backfill helper.
++func (s *Store) PendingIDs(ctx context.Context, conversationID int64, limit int) ([]int64, error) {
++	query := `SELECT m.message_id
++	          FROM messages m
++	          LEFT JOIN message_embeddings e
++	            ON e.message_id = m.message_id AND e.model = ?
++	          WHERE e.message_id IS NULL`
++	args := []any{s.model}
++	if conversationID > 0 {
++		query += ` AND m.conversation_id = ?`
++		args = append(args, conversationID)
++	}
++	query += ` ORDER BY m.message_id`
++	if limit > 0 {
++		query += ` LIMIT ?`
++		args = append(args, limit)
++	}
++
++	rows, err := s.db.QueryContext(ctx, query, args...)
++	if err != nil {
++		return nil, fmt.Errorf("embeddings: pending ids: %w", err)
++	}
++	defer rows.Close()
++
++	var ids []int64
++	for rows.Next() {
++		var id int64
++		if err := rows.Scan(&id); err != nil {
++			return nil, fmt.Errorf("embeddings: scan pending id: %w", err)
++		}
++		ids = append(ids, id)
++	}
++	return ids, rows.Err()
++}
++
++// GetContent returns the text content for a message, used when backfilling.
++// Falls back to parts text when the top-level content column is empty.
++func (s *Store) GetContent(ctx context.Context, messageID int64) (string, error) {
++	var content string
++	err := s.db.QueryRowContext(ctx,
++		`SELECT content FROM messages WHERE message_id = ?`, messageID).Scan(&content)
++	if err != nil {
++		return "", fmt.Errorf("embeddings: get content: %w", err)
++	}
++	return content, nil
++}
++
++// encodeVector serializes []float32 as little-endian float32 bytes.
++func encodeVector(vec []float32) []byte {
++	blob := make([]byte, len(vec)*4)
++	for i, v := range vec {
++		binary.LittleEndian.PutUint32(blob[i*4:], math.Float32bits(v))
++	}
++	return blob
++}
++
++// decodeVectorBlob deserializes a vector BLOB, verifying the length.
++func decodeVectorBlob(blob []byte, wantDim int) ([]float32, error) {
++	if len(blob)%4 != 0 {
++		return nil, fmt.Errorf("embeddings: blob length %d not a multiple of 4", len(blob))
++	}
++	if wantDim > 0 && len(blob)/4 != wantDim {
++		return nil, fmt.Errorf("%w: blob has %d floats, want %d", ErrDimMismatch, len(blob)/4, wantDim)
++	}
++	vec := make([]float32, len(blob)/4)
++	for i := range vec {
++		bits := binary.LittleEndian.Uint32(blob[i*4 : i*4+4])
++		vec[i] = math.Float32frombits(bits)
++	}
++	return vec, nil
++}
+diff --git a/pkg/embeddings/store_test.go b/pkg/embeddings/store_test.go
+new file mode 100644
+index 00000000..45ad525c
+--- /dev/null
++++ b/pkg/embeddings/store_test.go
+@@ -0,0 +1,338 @@
++package embeddings
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"hash/fnv"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	_ "modernc.org/sqlite"
++)
++
++func openTestDB(t *testing.T) *sql.DB {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "embeddings_test.db")
++	// _pragma=foreign_keys(1) mirrors how the seahorse engine should enable
++	// FK enforcement when sharing the DB (per-connection PRAGMA alone does
++	// not survive pool reuse).
++	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { db.Close() })
++	return db
++}
++
++// createMessagesTable creates the minimal messages table the embeddings
++// schema references via ON DELETE CASCADE (in real usage seahorse's
++// runSchema creates it first).
++func createMessagesTable(t *testing.T, db *sql.DB) {
++	t.Helper()
++	if _, err := db.Exec(`CREATE TABLE messages (
++		message_id INTEGER PRIMARY KEY AUTOINCREMENT,
++		conversation_id INTEGER NOT NULL DEFAULT 1,
++		role TEXT NOT NULL DEFAULT '',
++		content TEXT NOT NULL DEFAULT '',
++		model_name TEXT NOT NULL DEFAULT '',
++		reasoning_content TEXT NOT NULL DEFAULT '',
++		token_count INTEGER NOT NULL DEFAULT 0,
++		created_at TEXT NOT NULL DEFAULT (datetime('now'))
++	)`); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestStoreMigrateIdempotent(t *testing.T) {
++	db := openTestDB(t)
++	ctx := context.Background()
++
++	s1, err := NewStore(ctx, db, "model-a", 3)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Second NewStore on the same DB must not error (CREATE IF NOT EXISTS).
++	s2, err := NewStore(ctx, db, "model-a", 3)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if s1.Model() != "model-a" || s2.Dim() != 3 {
++		t.Fatalf("unexpected store config: %#v %#v", s1, s2)
++	}
++}
++
++func TestStoreUpsertRoundTrip(t *testing.T) {
++	db := openTestDB(t)
++	createMessagesTable(t, db)
++	ctx := context.Background()
++
++	s, err := NewStore(ctx, db, "jina-embeddings-v3", 3)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Insert two messages so CASCADE + pending queries make sense.
++	if _, err := db.Exec(`INSERT INTO messages (content) VALUES ('alpha'), ('beta')`); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := s.Upsert(ctx, 1, []float32{0.1, 0.2, 0.3}); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.Upsert(ctx, 2, []float32{0.4, 0.5, 0.6}); err != nil {
++		t.Fatal(err)
++	}
++
++	n, err := s.Count(ctx)
++	if err != nil || n != 2 {
++		t.Fatalf("count = %d, %v; want 2", n, err)
++	}
++
++	ix, err := s.LoadIndex(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ix.Len() != 2 {
++		t.Fatalf("index len = %d, want 2", ix.Len())
++	}
++
++	// The second message's vector should dominate a query near it.
++	hits := ix.Search([]float32{0.41, 0.51, 0.61}, 1, 0)
++	if len(hits) != 1 || hits[0].MessageID != 2 {
++		t.Fatalf("expected message 2, got %#v", hits)
++	}
++}
++
++func TestStoreUpsertReplaces(t *testing.T) {
++	db := openTestDB(t)
++	createMessagesTable(t, db)
++	ctx := context.Background()
++
++	s, err := NewStore(ctx, db, "m", 3)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := db.Exec(`INSERT INTO messages (content) VALUES ('x')`); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := s.Upsert(ctx, 1, []float32{1, 0, 0}); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.Upsert(ctx, 1, []float32{0, 1, 0}); err != nil {
++		t.Fatal(err)
++	}
++
++	n, _ := s.Count(ctx)
++	if n != 1 {
++		t.Fatalf("count = %d, want 1 (replaced)", n)
++	}
++	ix, _ := s.LoadIndex(ctx)
++	hits := ix.Search([]float32{0, 1, 0}, 1, 0)
++	if len(hits) != 1 || hits[0].MessageID != 1 {
++		t.Fatalf("expected replaced vector, got %#v", hits)
++	}
++}
++
++func TestStoreUpsertDimMismatch(t *testing.T) {
++	db := openTestDB(t)
++	createMessagesTable(t, db)
++	ctx := context.Background()
++
++	s, err := NewStore(ctx, db, "m", 3)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := db.Exec(`INSERT INTO messages (content) VALUES ('x')`); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.Upsert(ctx, 1, []float32{1, 0}); !errors.Is(err, ErrDimMismatch) {
++		t.Fatalf("expected ErrDimMismatch, got %v", err)
++	}
++}
++
++func TestStoreDelete(t *testing.T) {
++	db := openTestDB(t)
++	createMessagesTable(t, db)
++	ctx := context.Background()
++
++	s, _ := NewStore(ctx, db, "m", 3)
++	if _, err := db.Exec(`INSERT INTO messages (content) VALUES ('a'), ('b')`); err != nil {
++		t.Fatal(err)
++	}
++	_ = s.Upsert(ctx, 1, []float32{1, 0, 0})
++	_ = s.Upsert(ctx, 2, []float32{0, 1, 0})
++
++	if err := s.Delete(ctx, 1); err != nil {
++		t.Fatal(err)
++	}
++	n, _ := s.Count(ctx)
++	if n != 1 {
++		t.Fatalf("count = %d, want 1", n)
++	}
++}
++
++func TestStoreModelSeparation(t *testing.T) {
++	db := openTestDB(t)
++	createMessagesTable(t, db)
++	ctx := context.Background()
++
++	sA, _ := NewStore(ctx, db, "model-a", 3)
++	sB, _ := NewStore(ctx, db, "model-b", 4)
++	if _, err := db.Exec(`INSERT INTO messages (content) VALUES ('a'), ('b'), ('c')`); err != nil {
++		t.Fatal(err)
++	}
++	_ = sA.Upsert(ctx, 1, []float32{1, 0, 0})
++	_ = sB.Upsert(ctx, 2, []float32{0, 1, 0, 0})
++
++	nA, _ := sA.CountForModel(ctx)
++	nB, _ := sB.CountForModel(ctx)
++	if nA != 1 || nB != 1 {
++		t.Fatalf("model counts = %d/%d, want 1/1", nA, nB)
++	}
++	total, _ := sA.Count(ctx)
++	if total != 2 {
++		t.Fatalf("total count = %d, want 2", total)
++	}
++
++	// LoadIndex for A must only include A's row (and match A's dim).
++	ixA, err := sA.LoadIndex(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ixA.Len() != 1 || ixA.Dim() != 3 {
++		t.Fatalf("index A len/dim = %d/%d, want 1/3", ixA.Len(), ixA.Dim())
++	}
++}
++
++func TestStorePendingIDs(t *testing.T) {
++	db := openTestDB(t)
++	createMessagesTable(t, db)
++	ctx := context.Background()
++
++	s, _ := NewStore(ctx, db, "m", 3)
++	if _, err := db.Exec(`INSERT INTO messages (content) VALUES ('a'), ('b'), ('c')`); err != nil {
++		t.Fatal(err)
++	}
++	_ = s.Upsert(ctx, 2, []float32{0, 1, 0})
++
++	pending, err := s.PendingIDs(ctx, 0, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(pending) != 2 || pending[0] != 1 || pending[1] != 3 {
++		t.Fatalf("pending = %#v, want [1 3]", pending)
++	}
++
++	limited, _ := s.PendingIDs(ctx, 0, 1)
++	if len(limited) != 1 || limited[0] != 1 {
++		t.Fatalf("limited pending = %#v, want [1]", limited)
++	}
++}
++
++func TestStoreGetContent(t *testing.T) {
++	db := openTestDB(t)
++	createMessagesTable(t, db)
++	ctx := context.Background()
++
++	s, _ := NewStore(ctx, db, "m", 3)
++	if _, err := db.Exec(`INSERT INTO messages (content) VALUES ('remember the a770 saga')`); err != nil {
++		t.Fatal(err)
++	}
++	content, err := s.GetContent(ctx, 1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if content != "remember the a770 saga" {
++		t.Fatalf("content = %q", content)
++	}
++}
++
++func TestStoreCascadeDelete(t *testing.T) {
++	db := openTestDB(t)
++	createMessagesTable(t, db)
++	ctx := context.Background()
++
++	s, _ := NewStore(ctx, db, "m", 3)
++	if _, err := db.Exec(`INSERT INTO messages (content) VALUES ('x')`); err != nil {
++		t.Fatal(err)
++	}
++	_ = s.Upsert(ctx, 1, []float32{1, 0, 0})
++	if _, err := db.Exec(`DELETE FROM messages WHERE message_id = 1`); err != nil {
++		t.Fatal(err)
++	}
++	n, _ := s.Count(ctx)
++	if n != 0 {
++		t.Fatalf("count after cascade = %d, want 0", n)
++	}
++}
++
++// TestStoreBackfillSmoke is a tiny end-to-end: write rows, load index,
++// search. It mirrors the M3 backfill loop shape.
++func TestStoreBackfillSmoke(t *testing.T) {
++	db := openTestDB(t)
++	createMessagesTable(t, db)
++	ctx := context.Background()
++
++	s, _ := NewStore(ctx, db, "m", 16)
++	if _, err := db.Exec(`INSERT INTO messages (content) VALUES
++		('the arc a770 wedges under compute load'),
++		('pi-hole dns runs on swarm1 and swarm2'),
++		('the p70 uses nvidia driver 580')`); err != nil {
++		t.Fatal(err)
++	}
++
++	// Simulate embedding each pending message with deterministic pseudo-vectors.
++	for {
++		pending, err := s.PendingIDs(ctx, 0, 10)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if len(pending) == 0 {
++			break
++		}
++		for _, id := range pending {
++			content, err := s.GetContent(ctx, id)
++			if err != nil {
++				t.Fatal(err)
++			}
++			vec := pseudoVector(content)
++			if err := s.Upsert(ctx, id, vec); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++
++	n, _ := s.Count(ctx)
++	if n != 3 {
++		t.Fatalf("backfilled count = %d, want 3", n)
++	}
++
++	ix, err := s.LoadIndex(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ix.Len() != 3 {
++		t.Fatalf("index len = %d, want 3", ix.Len())
++	}
++	hits := ix.Search(pseudoVector("arc gpu resets and wedges"), 1, 0)
++	if len(hits) != 1 || hits[0].MessageID != 1 {
++		t.Fatalf("expected arc message hit, got %#v", hits)
++	}
++}
++
++// pseudoVector builds a small bag-of-words vector: each word hashes to a
++// dimension and increments it. Words shared between texts produce cosine
++// similarity, which is exactly what the smoke test needs without a real
++// embedding server.
++func pseudoVector(s string) []float32 {
++	const dim = 16
++	vec := make([]float32, dim)
++	for _, word := range strings.Fields(strings.ToLower(s)) {
++		h := fnv.New32a()
++		h.Write([]byte(word))
++		vec[h.Sum32()%dim] += 1
++	}
++	return vec
++}
+-- 
+2.53.0
+

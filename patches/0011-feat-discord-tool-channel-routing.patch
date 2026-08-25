@@ -1,0 +1,215 @@
+From 0ca93fedc89e7c12caa1eaf4d7ff756d49a08100 Mon Sep 17 00:00:00 2001
+From: root <root@Skynet>
+Date: Mon, 24 Aug 2026 22:54:25 -0400
+Subject: [PATCH] feat(channels): route tool feedback + reasoning to dedicated
+ Discord channels
+
+Add tool_channel_id config (parallel to reasoning_channel_id) so Discord
+tool-feedback messages can be delivered to a separate channel while the
+final answer stays in the original chat. Reasoning already supported via
+reasoning_channel_id; this wires the new field through config, base
+channel options, Discord Send/Finalize/Dismiss paths, web API, and the
+launcher channel config form.
+---
+ pkg/channels/base.go                          | 11 ++++++
+ pkg/channels/discord/discord.go               | 36 ++++++++++++++++++-
+ pkg/config/config_channel.go                  |  2 ++
+ web/backend/api/channels.go                   |  3 ++
+ web/backend/api/gateway.go                    |  2 ++
+ .../channels/channel-config-page.tsx          |  1 +
+ .../channels/channel-forms/generic-form.tsx   |  2 +-
+ 7 files changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/pkg/channels/base.go b/pkg/channels/base.go
+index 81d9ab72..c40ffe8b 100644
+--- a/pkg/channels/base.go
++++ b/pkg/channels/base.go
+@@ -53,6 +53,7 @@ type Channel interface {
+ 	IsAllowed(senderID string) bool
+ 	IsAllowedSender(sender bus.SenderInfo) bool
+ 	ReasoningChannelID() string
++	ToolChannelID() string
+ }
+ 
+ // BaseChannelOption is a functional option for configuring a BaseChannel.
+@@ -75,6 +76,11 @@ func WithReasoningChannelID(id string) BaseChannelOption {
+ 	return func(c *BaseChannel) { c.reasoningChannelID = id }
+ }
+ 
++// WithToolChannelID sets the tool-feedback channel ID where tool calls should be sent.
++func WithToolChannelID(id string) BaseChannelOption {
++	return func(c *BaseChannel) { c.toolChannelID = id }
++}
++
+ // MessageLengthProvider is an opt-in interface that channels implement
+ // to advertise their maximum message length. The Manager uses this via
+ // type assertion to decide whether to split outbound messages.
+@@ -94,6 +100,7 @@ type BaseChannel struct {
+ 	placeholderRecorder PlaceholderRecorder
+ 	owner               Channel // the concrete channel that embeds this BaseChannel
+ 	reasoningChannelID  string
++	toolChannelID       string
+ }
+ 
+ func NewBaseChannel(
+@@ -197,6 +204,10 @@ func (c *BaseChannel) ReasoningChannelID() string {
+ 	return c.reasoningChannelID
+ }
+ 
++func (c *BaseChannel) ToolChannelID() string {
++	return c.toolChannelID
++}
++
+ func (c *BaseChannel) IsRunning() bool {
+ 	return c.running.Load()
+ }
+diff --git a/pkg/channels/discord/discord.go b/pkg/channels/discord/discord.go
+index 394a06ad..f94526fc 100644
+--- a/pkg/channels/discord/discord.go
++++ b/pkg/channels/discord/discord.go
+@@ -86,6 +86,7 @@ func NewDiscordChannel(
+ 		channels.WithMaxMessageLength(2000),
+ 		channels.WithGroupTrigger(bc.GroupTrigger),
+ 		channels.WithReasoningChannelID(bc.ReasoningChannelID),
++		channels.WithToolChannelID(bc.ToolChannelID),
+ 	)
+ 
+ 	ch := &DiscordChannel{
+@@ -176,6 +177,10 @@ func (c *DiscordChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]s
+ 	}
+ 
+ 	isToolFeedback := outboundMessageIsToolFeedback(msg)
++	if isToolFeedback {
++		// Route tool-feedback messages to the dedicated tool channel when configured.
++		channelID = c.toolFeedbackChannelID(channelID)
++	}
+ 	if isToolFeedback {
+ 		if msgID, handled, err := c.progress.Update(ctx, channelID, msg.Content); handled {
+ 			if err != nil {
+@@ -434,6 +439,13 @@ func (c *DiscordChannel) DismissToolFeedbackMessage(ctx context.Context, chatID
+ 		return
+ 	}
+ 	c.dismissTrackedToolFeedbackMessage(ctx, chatID, msgID)
++	// If tool feedback was routed to a dedicated channel, dismiss it there too.
++	toolID := c.toolFeedbackChannelID(chatID)
++	if toolID != chatID {
++		if msgID, ok := c.currentToolFeedbackMessage(toolID); ok {
++			c.dismissTrackedToolFeedbackMessage(ctx, toolID, msgID)
++		}
++	}
+ }
+ 
+ func (c *DiscordChannel) dismissTrackedToolFeedbackMessage(ctx context.Context, chatID, messageID string) {
+@@ -465,7 +477,29 @@ func (c *DiscordChannel) FinalizeToolFeedbackMessage(ctx context.Context, msg bu
+ 	if outboundMessageIsToolFeedback(msg) {
+ 		return nil, false
+ 	}
+-	return c.finalizeTrackedToolFeedbackMessage(ctx, msg.ChatID, msg.Content, c.EditMessage)
++	// Normal path: finalize (edit in place) any tracked tool feedback in the same chat.
++	if msgIDs, handled := c.finalizeTrackedToolFeedbackMessage(ctx, msg.ChatID, msg.Content, c.EditMessage); handled {
++		return msgIDs, true
++	}
++	// Tool-channel path: if tool feedback was routed to a dedicated channel,
++	// dismiss (delete) the tracked message there now that the turn is complete.
++	toolID := c.toolFeedbackChannelID(msg.ChatID)
++	if toolID != msg.ChatID {
++		if msgID, ok := c.currentToolFeedbackMessage(toolID); ok {
++			c.dismissTrackedToolFeedbackMessage(ctx, toolID, msgID)
++		}
++	}
++	return nil, false
++}
++
++// toolFeedbackChannelID returns the channel where tool-feedback messages should
++// be delivered. When a dedicated tool channel is configured it is used for all
++// tool-feedback output; otherwise the original chat is used.
++func (c *DiscordChannel) toolFeedbackChannelID(chatID string) string {
++	if c.bc != nil && c.bc.ToolChannelID != "" {
++		return c.bc.ToolChannelID
++	}
++	return chatID
+ }
+ 
+ func (c *DiscordChannel) sendChunk(ctx context.Context, channelID, content, replyToID string) (string, error) {
+diff --git a/pkg/config/config_channel.go b/pkg/config/config_channel.go
+index 232c37cd..58d4d576 100644
+--- a/pkg/config/config_channel.go
++++ b/pkg/config/config_channel.go
+@@ -226,6 +226,7 @@ type Channel struct {
+ 	Type               string              `json:"type"                    yaml:"-"`
+ 	AllowFrom          FlexibleStringSlice `json:"allow_from,omitempty"    yaml:"-"`
+ 	ReasoningChannelID string              `json:"reasoning_channel_id"    yaml:"-"`
++	ToolChannelID      string              `json:"tool_channel_id"       yaml:"-"`
+ 	GroupTrigger       GroupTriggerConfig  `json:"group_trigger,omitempty" yaml:"-"`
+ 	Typing             TypingConfig        `json:"typing,omitempty"        yaml:"-"`
+ 	Placeholder        PlaceholderConfig   `json:"placeholder,omitempty"   yaml:"-"`
+@@ -543,6 +544,7 @@ var BaseFieldNames = map[string]struct{}{
+ 	"type":                 {},
+ 	"allow_from":           {},
+ 	"reasoning_channel_id": {},
++	"tool_channel_id":      {},
+ 	"group_trigger":        {},
+ 	"typing":               {},
+ 	"placeholder":          {},
+diff --git a/web/backend/api/channels.go b/web/backend/api/channels.go
+index b98c0557..375d24bd 100644
+--- a/web/backend/api/channels.go
++++ b/web/backend/api/channels.go
+@@ -162,6 +162,9 @@ func addChannelCommonConfig(settings map[string]any, bc *config.Channel) {
+ 	if bc.ReasoningChannelID != "" {
+ 		settings["reasoning_channel_id"] = bc.ReasoningChannelID
+ 	}
++	if bc.ToolChannelID != "" {
++		settings["tool_channel_id"] = bc.ToolChannelID
++	}
+ 	if bc.GroupTrigger.MentionOnly || len(bc.GroupTrigger.Prefixes) > 0 {
+ 		settings["group_trigger"] = bc.GroupTrigger
+ 	}
+diff --git a/web/backend/api/gateway.go b/web/backend/api/gateway.go
+index 636f7448..7683447b 100644
+--- a/web/backend/api/gateway.go
++++ b/web/backend/api/gateway.go
+@@ -683,6 +683,7 @@ func computeChannelSignatures(channels config.ChannelsConfig) []string {
+ 			Type               string                     `json:"type"`
+ 			AllowFrom          config.FlexibleStringSlice `json:"allow_from,omitempty"`
+ 			ReasoningChannelID string                     `json:"reasoning_channel_id,omitempty"`
++			ToolChannelID      string                     `json:"tool_channel_id,omitempty"`
+ 			GroupTrigger       config.GroupTriggerConfig  `json:"group_trigger,omitempty"`
+ 			Typing             config.TypingConfig        `json:"typing,omitempty"`
+ 			Placeholder        config.PlaceholderConfig   `json:"placeholder,omitempty"`
+@@ -692,6 +693,7 @@ func computeChannelSignatures(channels config.ChannelsConfig) []string {
+ 			Type:               channel.Type,
+ 			AllowFrom:          channel.AllowFrom,
+ 			ReasoningChannelID: channel.ReasoningChannelID,
++			ToolChannelID:      channel.ToolChannelID,
+ 			GroupTrigger:       channel.GroupTrigger,
+ 			Typing:             channel.Typing,
+ 			Placeholder:        channel.Placeholder,
+diff --git a/web/frontend/src/components/channels/channel-config-page.tsx b/web/frontend/src/components/channels/channel-config-page.tsx
+index 10e2a225..e26cad53 100644
+--- a/web/frontend/src/components/channels/channel-config-page.tsx
++++ b/web/frontend/src/components/channels/channel-config-page.tsx
+@@ -98,6 +98,7 @@ const CHANNEL_COMMON_CONFIG_KEYS = new Set([
+   "group_trigger",
+   "placeholder",
+   "reasoning_channel_id",
++  "tool_channel_id",
+   "typing",
+ ])
+ 
+diff --git a/web/frontend/src/components/channels/channel-forms/generic-form.tsx b/web/frontend/src/components/channels/channel-forms/generic-form.tsx
+index ee429321..0d2eb6e0 100644
+--- a/web/frontend/src/components/channels/channel-forms/generic-form.tsx
++++ b/web/frontend/src/components/channels/channel-forms/generic-form.tsx
+@@ -35,7 +35,7 @@ interface GenericFormProps {
+ }
+ 
+ // Fields to skip in the generic form (handled by enabled toggle or internal).
+-const SKIP_FIELDS = new Set(["enabled", "reasoning_channel_id"])
++const SKIP_FIELDS = new Set(["enabled", "reasoning_channel_id", "tool_channel_id"])
+ 
+ // Fields that are objects/nested — show as JSON or skip.
+ const OBJECT_FIELDS = new Set([
+-- 
+2.47.3
+

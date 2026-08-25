@@ -1,0 +1,83 @@
+From 36a079a3abcbd19cd0b7e6b7494679b0af5c0cf3 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-15-227.ca-central-1.compute.internal>
+Date: Thu, 20 Aug 2026 19:59:24 -0400
+Subject: [PATCH 5/8] fix(agent): align vision reroute provider lookup with
+ candidate keying
+
+The upstream refactor keyed CandidateProviders by candidateProviderKey
+(config-level hash) and runtime ModelKey. recoverVisionRouting only
+probed StableKey (identity|config hash), which missed both registration
+schemes and made rerouting silently fail.
+
+- candidateProviderFromMap probes ModelKey first, then
+  candidateProviderKey, then StableKey
+- recoverVisionRouting uses it for the initial and post-populate lookups
+- ported test registers the alternate vision stub under the image
+  candidate's config key too, matching the current codebase convention
+---
+ pkg/agent/agent_test.go |  5 +++++
+ pkg/agent/llm_media.go  | 24 +++++++++++++++++++++---
+ 2 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/pkg/agent/agent_test.go b/pkg/agent/agent_test.go
+index f485d80a..fb3754fc 100644
+--- a/pkg/agent/agent_test.go
++++ b/pkg/agent/agent_test.go
+@@ -7921,6 +7921,11 @@ func TestAgentLoop_VisionUnsupportedErrorReroutesToAlternateImageModel(t *testin
+ 	successProvider := &visionRerouteSuccessProvider{}
+ 	agent.CandidateProviders[providers.ModelKey("openai", "broken-vision-model")] = textProvider
+ 	agent.CandidateProviders[providers.ModelKey("openai", "gpt-5.4")] = successProvider
++	for _, cand := range agent.ImageCandidates {
++		if providers.NormalizeProvider(cand.Provider) == "openai" && strings.TrimSpace(cand.Model) == "gpt-5.4" {
++			agent.CandidateProviders[candidateProviderKey(cand)] = successProvider
++		}
++	}
+ 
+ 	timeoutCtx, cancel := context.WithTimeout(context.Background(), responseTimeout)
+ 	defer cancel()
+diff --git a/pkg/agent/llm_media.go b/pkg/agent/llm_media.go
+index 5ea91291..b154178a 100644
+--- a/pkg/agent/llm_media.go
++++ b/pkg/agent/llm_media.go
+@@ -198,6 +198,24 @@ func (p *Pipeline) routeMediaTurn(ts *turnState, exec *turnExecution) error {
+ 	return nil
+ }
+ 
++// candidateProviderFromMap resolves the registered provider for a resolved
++// fallback candidate. The runtime provider/model key is the most specific
++// identity (and the one explicit registrations/overrides use), so probe it
++// first; fall back to the config-level candidateProviderKey and finally the
++// StableKey for registrations that only used one scheme.
++func candidateProviderFromMap(providersByKey map[string]providers.LLMProvider, candidate providers.FallbackCandidate) providers.LLMProvider {
++	if providersByKey == nil {
++		return nil
++	}
++	if p := providersByKey[providers.ModelKey(candidate.Provider, candidate.Model)]; p != nil {
++		return p
++	}
++	if p := providersByKey[candidateProviderKey(candidate)]; p != nil {
++		return p
++	}
++	return providersByKey[candidate.StableKey()]
++}
++
+ func modelConfigLooksVisionCapable(mc *config.ModelConfig) bool {
+ 	if mc == nil {
+ 		return false
+@@ -283,10 +301,10 @@ func (p *Pipeline) recoverVisionRouting(ts *turnState, exec *turnExecution) bool
+ 		if resolved[0].StableKey() == currentKey {
+ 			continue
+ 		}
+-		provider, ok := ts.agent.CandidateProviders[resolved[0].StableKey()]
+-		if !ok || provider == nil {
++		provider := candidateProviderFromMap(ts.agent.CandidateProviders, resolved[0])
++		if provider == nil {
+ 			populateCandidateProvidersFromNames(p.Cfg, ts.agent.Workspace, []string{name}, ts.agent.CandidateProviders)
+-			provider = ts.agent.CandidateProviders[resolved[0].StableKey()]
++			provider = candidateProviderFromMap(ts.agent.CandidateProviders, resolved[0])
+ 		}
+ 		if provider == nil {
+ 			continue
+-- 
+2.53.0
+
