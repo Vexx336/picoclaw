@@ -94,6 +94,10 @@ func resolveMediaRefs(
 
 		for _, ref := range m.Media {
 			if !strings.HasPrefix(ref, "media://") {
+				if idx < currentTurnStart {
+					// Historical data URLs should not be passed to LLM
+					continue
+				}
 				resolved = append(resolved, ref)
 				continue
 			}
