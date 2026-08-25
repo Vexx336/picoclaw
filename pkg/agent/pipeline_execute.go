@@ -216,6 +216,8 @@ toolLoop:
 							outboundTurnMessageOptions{kind: messageKindToolFeedback},
 						))
 						fbCancel()
+						// Mirror tool feedback to the dedicated Discord tool channel (cross-channel).
+						al.mirrorAuxiliaryToDiscord(turnCtx, messageKindToolFeedback, feedbackMsg, ts.channel)
 					}
 
 					toolDuration := time.Duration(0)
@@ -508,6 +510,8 @@ toolLoop:
 				outboundTurnMessageOptions{kind: messageKindToolFeedback},
 			))
 			fbCancel()
+			// Mirror tool feedback to the dedicated Discord tool channel (cross-channel).
+			al.mirrorAuxiliaryToDiscord(turnCtx, messageKindToolFeedback, feedbackMsg, ts.channel)
 		}
 
 		toolCallID := tc.ID
