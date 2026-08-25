@@ -1598,6 +1598,9 @@ func LoadConfig(path string) (*Config, error) {
 	cfg.Session.ApplyDmScope()
 	cfg.Session.DeriveDmScope()
 
+	// Apply active_profile so profile defaults merge into the live agents block
+	cfg.Agents.ApplyProfile(cfg.Agents.ActiveProfile)
+
 	return cfg, nil
 }
 
